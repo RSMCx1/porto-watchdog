@@ -1,0 +1,51 @@
+# =============================================================================
+# Mumla Channel Switcher - Docker Compose
+# =============================================================================
+#
+# OPTION A - Add to your EXISTING Mumble stack:
+#   Copy just the 'channel-bot' service block into your existing
+#   docker-compose.yml. Make sure the Mumble server hostname in
+#   bot_config.ini matches your murmur service name.
+#
+# OPTION B - Use this whole file as a standalone stack:
+#   Includes a murmur service as example. Adjust to match your setup.
+#
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # Your existing Mumble server (example - adjust to match YOUR config)
+  # If adding to an existing stack, skip this - you already have it
+  # -------------------------------------------------------------------------
+  murmur:
+    image: mumblevoip/mumble-server:latest
+    container_name: murmur
+    ports:
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+    volumes:
+      - murmur-data:/data
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # >>> ADD THIS TO YOUR EXISTING STACK <<<
+  # -------------------------------------------------------------------------
+  channel-bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: channel-bot
+    ports:
+      # UDP port for knob_reader packets from your TE300K radios
+      - "4378:4378/udp"
+    volumes:
+      # Mount config externally so you can edit without rebuilding
+      - ./bot_config.ini:/app/bot_config.ini:ro
+    depends_on:
+      - murmur
+    restart: unless-stopped
+    # Small delay so murmur is ready before the bot connects
+    entrypoint: ["sh", "-c", "sleep 5 && python3 channel_bot.py -c /app/bot_config.ini"]
+
+volumes:
+  murmur-data:

@@ -1,11 +1,11 @@
 services:
   # -------------------------------------------------------------------------
-  # Channel bot - add this to your existing Mumble stack
+  # Porto Watchdog - remote watchdog for channel switching & alerts
   # All config via environment variables - no config files needed
   # -------------------------------------------------------------------------
-  channel-bot:
+  porto-watchdog:
     image: rsmcx1/porto-watchdog:latest
-    container_name: channel-bot
+    container_name: porto-watchdog
     ports:
       - "4378:4378/udp"
     environment:

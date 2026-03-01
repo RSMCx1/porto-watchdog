@@ -41,7 +41,7 @@ def _load_pymumble():
         print("ERROR: pymumble not found. Install with: pip install pymumble")
         sys.exit(1)
 
-log = logging.getLogger('channel-bot')
+log = logging.getLogger('porto-watchdog')
 
 # Packet layout (must match knob_reader.c)
 PKT_SIZE = 45
@@ -413,7 +413,7 @@ def load_env_config():
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description='Mumla Channel Bot - Multi-radio')
+    p = argparse.ArgumentParser(description='Porto Watchdog - remote radio control')
     p.add_argument('--list', action='store_true',
                    help='List channels/users and exit')
     p.add_argument('--gen-secret', action='store_true',

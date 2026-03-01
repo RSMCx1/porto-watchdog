@@ -1,180 +1,285 @@
-# Mumla Channel Switcher
+# Porto Watchdog
 
-Hardware knob + button control for Mumble/Mumla on TE300K radios.
-Supports multiple radios, emergency alerts, ident broadcasts, HMAC-signed
-packets, wildcard user matching, and Docker deployment.
+Hardware control system for TE300K Mumble radios. Onboard a radio once,
+everything auto-starts on boot and runs forever.
 
-## Architecture
+Two watchdogs work together:
+
+- **Local watchdog** (`porto-watchdog` binary) — runs in the background on
+  each radio, intercepts hardware key events, handles PTT locally and
+  forwards knob/button presses to the remote watchdog over UDP.
+- **Remote watchdog** (`porto-watchdog` Docker container) — runs on your
+  server, receives key events from all radios, switches channels, and
+  broadcasts emergency/ident messages through the Mumble server.
+
+## What the Buttons Do
+
+| Input | Key | What happens |
+|-------|-----|--------------|
+| **PTT button** | F1 | Hold to talk, release to stop (handled locally via Mumla) |
+| **Knob clockwise** | F14 | Next channel — forwarded to remote watchdog, TTS announces |
+| **Knob counter-clockwise** | F13 | Previous channel — forwarded to remote watchdog |
+| **Side button** | F2 | Ident — forwarded to remote watchdog, announces your name |
+| **Emergency button** | F3 | Emergency — forwarded to remote watchdog, broadcasts alert |
+
+## How It Works
 
 ```
-  TE300K #1                     TE300K #2
-  ┌──────────────────┐          ┌──────────────────┐
-  │  Knob  F2  F3    │          │  Knob  F2  F3    │
-  │  N/P  Ident Emrg │          │  N/P  Ident Emrg │
-  └───┬────┬────┬────┘          └───┬────┬────┬────┘
-      │    │    │                    │    │    │
-  ┌───┴────┴────┴────┐          ┌───┴────┴────┴────┐
-  │   knob_reader     │          │   knob_reader     │
-  │   radio01         │          │   radio02         │
-  │   HMAC-SHA256     │          │   HMAC-SHA256     │
-  └────────┬──────────┘          └────────┬──────────┘
-           │  UDP :4378                   │
-           └──────────┬───────────────────┘
-                      ▼
-         ┌──────────────────────────┐
-         │  channel-bot (Docker)    │
-         │                          │
-         │  N/P → Move user + TTS  │
-         │  E   → "alert alert"    │
-         │  I   → username ident   │
-         └────────────┬─────────────┘
-                      │ Mumble protocol
-                      ▼
-         ┌──────────────────────────┐
-         │  Mumble Server (Docker)  │
-         └──────────────────────────┘
+  TE300K Radio (runs in background after boot)
+  ┌───────────────────────────────────────────────┐
+  │                                               │
+  │  PTT (F1)   Ident (F2)   Emergency (F3)      │
+  │  Knob CW (F14)     Knob CCW (F13)            │
+  │       │         │         │                   │
+  │  ┌────┴─────────┴─────────┴────────────────┐  │
+  │  │    porto-watchdog (local watchdog)       │  │
+  │  │    background daemon on the radio        │  │
+  │  │                                          │  │
+  │  │    Intercepts /dev/input/event3 + event4 │  │
+  │  │    Routes each keypress:                 │  │
+  │  │      F1  → local PTT socket              │  │
+  │  │      F2  → remote watchdog (UDP)         │  │
+  │  │      F3  → remote watchdog (UDP)         │  │
+  │  │      F13 → remote watchdog (UDP)         │  │
+  │  │      F14 → remote watchdog (UDP)         │  │
+  │  └──┬──────────────────────────┬────────────┘  │
+  │     │ PTT socket               │ UDP :4378     │
+  │  ┌──┴──────────────┐           │               │
+  │  │ pttbridge.apk   │           │               │
+  │  │ boot autostart  │           │               │
+  │  │ PTT → Mumla     │           │               │
+  │  └──┬──────────────┘           │               │
+  │  ┌──┴──────────────┐           │               │
+  │  │     Mumla       │           │               │
+  │  └──────┬──────────┘           │               │
+  └─────────┼──────────────────────┼───────────────┘
+            │ Mumble               │ UDP
+            ▼                      ▼
+  ┌──────────────────────────────────────────────┐
+  │            Server (Docker)                   │
+  │                                              │
+  │  ┌────────────────┐  ┌────────────────────┐  │
+  │  │ Mumble Server  │  │ porto-watchdog     │  │
+  │  │                │←─│ (remote watchdog)  │  │
+  │  │                │  │ moves users        │  │
+  │  │                │  │ broadcasts alerts  │  │
+  │  └────────────────┘  └────────────────────┘  │
+  └──────────────────────────────────────────────┘
 ```
 
-## Features
+The local watchdog runs as a background daemon — it starts on boot,
+reads hardware input events continuously, and never needs user
+interaction. PTT is handled entirely on the radio (low latency).
+Channel switching and alerts are forwarded as signed UDP packets to
+the remote watchdog, which executes them on the Mumble server.
 
-| Feature | Button | Command | Behavior |
-|---------|--------|---------|----------|
-| Next channel | Knob clockwise (KEY_F14) | N | Moves radio user to next channel, TTS announces name |
-| Prev channel | Knob counter-clockwise (KEY_F13) | P | Moves radio user to previous channel, TTS announces name |
-| Emergency | F3 button (KEY_F3) | E | Broadcasts "alert alert" to all users in the channel |
-| Ident | F2 side button (KEY_F2) | I | Broadcasts username to all users in the channel |
+## Setup Guide
 
-## Security
+### Step 1: Server — Deploy the remote watchdog
 
-| Layer | What | How |
-|-------|------|-----|
-| Authentication | Every packet signed | HMAC-SHA256 with pre-shared key |
-| Replay protection | Reject old packets | 30-second timestamp window |
-| IP allowlist | Restrict sources | Optional `ALLOWED_IPS` env var |
-| Per-radio identity | 8-char radio ID | Mapped to Mumble username |
+Do this once on your server.
 
-## Quick Start
-
-### 1. Generate a shared secret
+**1a. Generate a shared secret**
 
 ```bash
 docker run --rm rsmcx1/porto-watchdog --gen-secret
-# Output: Generated secret: aBcDeFgH...
 ```
 
-### 2. Server side (Docker)
+Save the output. Every radio and the server must use the same secret.
 
-Add the `channel-bot` service to your existing Mumble docker-compose stack.
-All config is via environment variables — no config files needed.
+**1b. Add porto-watchdog to your Docker stack**
 
-Key variables to set in your stack:
+Add the service from `docker-compose.yml` to your existing Mumble stack.
+The three variables you must set:
 
 ```yaml
 environment:
-  MUMBLE_HOST: your-mumble-service-name
-  SECRET: "the-secret-you-generated"
+  MUMBLE_HOST: your-mumble-container-name
+  SECRET: "the-secret-from-step-1a"
   RADIOS: "radio01=TE300K,radio02=TE300K-2"
 ```
 
-See `docker-compose.yml` for the full list with defaults.
+All other variables have sensible defaults (see full list below).
 
-**Wildcard matching:** Use `*` in radio usernames to match patterns.
-Example: `RADIOS="radio01=P*"` matches any connected user starting with P.
+**1c. Grant bot permissions**
 
-### 3. Each TE300K radio
+In your Mumble server ACL (root channel), grant **Move** permission
+to the bot user (`ChannelBot`).
 
-Push the binary and config:
+**1d. Open firewall**
+
+The remote watchdog listens on UDP port **4378**. Make sure your
+radios can reach it.
+
+### Step 2: Radio — One-time onboarding
+
+Connect the TE300K via USB. Do this once per radio, then unplug and go.
+
+**2a. Unlock app installs**
+
 ```bash
-# Edit knob.conf with the radio's unique ID and the shared secret
-adb push knob_reader /data/local/tmp/
-adb push knob.conf /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/knob_reader
-
-# Test
-adb shell /data/local/tmp/knob_reader -f /data/local/tmp/knob.conf
-
-# Background (survives ADB disconnect)
-adb shell "nohup /data/local/tmp/knob_reader -f /data/local/tmp/knob.conf >/dev/null 2>&1 &"
+adb shell setprop persist.telo.install enable
 ```
 
-Each radio gets its own `knob.conf` with a unique `radio_id` but the SAME `secret`.
+Persists across reboots. Only needed once per device.
 
-The `knob_reader` ARM binary is built automatically by CI — download it from
-the [Actions](../../actions) tab (artifact: `knob_reader-arm`).
+**2b. Install the apps**
 
-### 4. Mumble ACL
+```bash
+adb install pttbridge.apk
+adb install mumla.apk
+```
 
-Grant the bot **Move** permission in your Mumble server ACL.
+**2c. Prepare the radio config**
 
-### 5. Mumla TTS
+Copy `knob.conf.example` to `knob.conf` and fill in your values:
 
-Enable Text-to-Speech in Mumla settings. The bot sends channel names
-and alerts as text messages, which Mumla reads aloud.
+```ini
+host=192.168.1.100         # IP of your server running the remote watchdog
+port=4378                  # must match UDP_PORT on the server
+radio_id=radio01           # unique per radio (max 8 chars)
+secret=your-secret-here    # same secret as Step 1a
+device=/dev/input/event4   # knob input (don't change)
+button_device=/dev/input/event3  # button input (don't change)
+```
 
-## Environment Variables
+Each radio needs a **unique `radio_id`** but the **same `secret`**.
+
+**2d. Push files to the radio**
+
+```bash
+adb push porto-watchdog /data/local/tmp/porto-watchdog
+adb shell chmod 755 /data/local/tmp/porto-watchdog
+adb push knob.conf /data/local/tmp/knob.conf
+
+# Symlink for pttbridge.apk compatibility (it launches ptt_bridge by name)
+adb shell ln -sf /data/local/tmp/porto-watchdog /data/local/tmp/ptt_bridge
+```
+
+**2e. Start the service**
+
+```bash
+adb shell am startservice -a com.pttbridge.START
+```
+
+Only needed once. After this, everything auto-starts on every boot.
+
+**2f. Configure Mumla**
+
+Open Mumla on the radio, add your Mumble server, and enable
+**Text-to-Speech** in settings so channel names and alerts are
+read aloud through the speaker.
+
+### Step 3: Verify
+
+Reboot the radio. On boot, `pttbridge.apk` automatically:
+1. Starts the PTT socket service
+2. Launches the `porto-watchdog` local watchdog daemon
+3. Opens Mumla and connects to your Mumble server
+
+Test everything:
+- **Knob** — turn it, you should hear the channel name announced
+- **PTT** — hold the button, your voice should transmit
+- **Side button (F2)** — your name gets announced to the channel
+- **Emergency (F3)** — "alert alert" broadcasts to the channel
+
+**Done. Unplug the USB cable. The radio is onboarded.**
+
+## Adding More Radios
+
+Repeat Step 2 with a different `radio_id` in `knob.conf`.
+
+On the server, update the `RADIOS` env var and restart:
+
+```
+RADIOS="radio01=TE300K,radio02=TE300K-2,radio03=TE300K-3"
+```
+
+## RADIOS Format
+
+Comma-separated `radio_id=mumla_username` pairs.
+Wildcards supported — `*` matches anything, `?` matches one character:
+
+```
+RADIOS="radio01=TE300K"                        # exact match
+RADIOS="radio01=TE300K,radio02=TE300K-2"       # multiple radios
+RADIOS="radio01=P*"                            # any user starting with P
+```
+
+## Environment Variables (remote watchdog)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MUMBLE_HOST` | 127.0.0.1 | Mumble server hostname |
 | `MUMBLE_PORT` | 64738 | Mumble server port |
-| `BOT_USERNAME` | ChannelBot | Bot display name |
+| `BOT_USERNAME` | ChannelBot | Bot display name in Mumble |
 | `BOT_PASSWORD` | *(empty)* | Bot password |
 | `SECRET` | *(required)* | HMAC shared secret |
-| `ALLOWED_IPS` | *(empty=any)* | Comma-separated source IP allowlist |
+| `ALLOWED_IPS` | *(empty=any)* | Source IP allowlist |
 | `UDP_PORT` | 4378 | UDP listen port |
 | `UDP_ADDR` | 0.0.0.0 | UDP bind address |
-| `CHANNELS_SORT_BY` | id | Channel sort: `id` or `name` |
+| `CHANNELS_SORT_BY` | id | Channel order: `id` or `name` |
 | `CHANNELS_SKIP_ROOT` | true | Skip root channel |
 | `CHANNELS_WRAP_AROUND` | true | Wrap at channel boundaries |
-| `ANNOUNCE_ENABLED` | true | TTS channel announcements |
+| `ANNOUNCE_ENABLED` | true | TTS channel name on switch |
 | `ANNOUNCE_FORMAT` | {channel} | Channel announce template |
 | `EMERGENCY_FORMAT` | alert alert | Emergency broadcast message |
 | `IDENT_FORMAT` | {username} | Ident broadcast template |
-| `LOG_LEVEL` | INFO | Log level |
-| `RADIOS` | *(required)* | Radio mapping (see below) |
+| `LOG_LEVEL` | INFO | DEBUG, INFO, WARNING, ERROR |
+| `RADIOS` | *(required)* | Radio-to-user mapping |
 
-### RADIOS format
+## Security
 
-Comma-separated `radio_id=mumla_username` pairs. Supports `*` and `?` wildcards.
+All key events forwarded to the remote watchdog are authenticated.
 
-```
-RADIOS="radio01=TE300K"
-RADIOS="radio01=TE300K,radio02=TE300K-2,radio03=TE300K-3"
-RADIOS="radio01=P*"
-```
+| Layer | How |
+|-------|-----|
+| Authentication | Every UDP packet signed with HMAC-SHA256 |
+| Replay protection | Packets expire after 30 seconds |
+| IP allowlist | Optional `ALLOWED_IPS` env var |
+| Per-radio identity | 8-char radio ID in every packet |
+
+Unsigned or expired packets are silently dropped.
 
 ## Files
 
-| File | Where | Purpose |
-|------|-------|---------|
-| `knob_reader.c` | Radio (source) | C source - reads knob + buttons, sends signed UDP |
-| `knob_reader` | Radio (binary) | Pre-built ARM binary |
+| File | Where | What |
+|------|-------|------|
+| `knob_reader.c` | Source | C source for the local watchdog binary |
 | `knob.conf.example` | Radio | Per-radio config template |
-| `channel_bot.py` | Docker | Python bot - verifies packets, moves users, broadcasts |
-| `docker/Dockerfile` | Docker | Container build file |
-| `docker-compose.yml` | Docker | Stack definition with all env vars |
+| `channel_bot.py` | Docker | Remote watchdog server |
+| `docker-compose.yml` | Docker | Stack definition |
+| `docker/Dockerfile` | Docker | Container build |
 
-## Adding a New Radio
-
-1. Pick a `radio_id` (max 8 chars): e.g. `radio03`
-2. Add to `RADIOS` env var: `radio01=TE300K,radio02=TE300K-2,radio03=NewUser`
-3. Create a `knob.conf` on the new radio with `radio_id=radio03`
-4. Restart the bot: `docker compose restart channel-bot`
+Binaries are built automatically by CI — download `porto-watchdog` from
+the [Actions](../../actions) tab (artifact: `porto-watchdog-arm`).
 
 ## Troubleshooting
 
-**HMAC verification failed** — Secret mismatch between radio and bot.
-Check both `knob.conf` and `SECRET` env var have the same value.
+**Apps won't install** —
+`adb shell setprop persist.telo.install enable`
 
-**Replay rejected** — The TE300K clock is too far off. Check with `adb shell date`.
+**PTT not working** —
+`adb shell dumpsys activity services | grep pttbridge`
+If not running: `adb shell am startservice -a com.pttbridge.START`
 
-**User not found** — The username in `RADIOS` must match what Mumla connects as
-(case-sensitive). Use wildcards like `P*` if the exact name varies.
+**Channel switch / emergency / ident not working** —
+Check `knob.conf` on the radio: `host` must be reachable from the
+radio's network. Check UDP port 4378 is open. Check remote watchdog
+container logs.
 
-**Bot can't move users** — Grant Move permission in Mumble server ACL.
+**"HMAC verification failed"** —
+`secret` in `knob.conf` and `SECRET` env var must be identical.
 
-**UDP not arriving** — Check Docker port mapping (`4378:4378/udp`),
-host firewall, and that `knob.conf` has the correct host IP.
+**"Replay rejected"** —
+Radio clock is off. Check: `adb shell date`
 
-**Buttons not working** — Check `button_device` in `knob.conf` points to the
-correct `/dev/input/eventX`. Run `adb shell getevent -l` and press the buttons.
+**"User not found"** —
+Username in `RADIOS` must match Mumla's connection name (case-sensitive).
+Use `P*` wildcards if the name varies.
+
+**Bot can't move users** —
+Grant Move permission in Mumble ACL for the bot user.
+
+**No TTS** —
+Enable Text-to-Speech in Mumla settings on the radio.

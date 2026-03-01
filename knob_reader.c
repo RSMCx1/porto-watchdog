@@ -1,31 +1,29 @@
 /*
- * knob_reader - TE300K rotary knob + buttons -> authenticated UDP
- * ================================================================
- * Reads /dev/input/event4 ("channel-switch") for knob rotation and
- * /dev/input/event3 ("gpio-keys") for emergency/ident buttons.
- * Sends HMAC-signed UDP packets to the channel switcher bot.
+ * porto-watchdog - TE300K local watchdog daemon
+ * ==============================================
+ * Runs in the background on the TE300K radio, intercepts ALL hardware
+ * key events, and routes them:
  *
- * Packet format (45 bytes):
- *   [0]      command: 'N' (next), 'P' (prev), 'E' (emergency), 'I' (ident)
+ *   LOCAL (PTT → Mumla via pttbridge.apk socket):
+ *     /dev/input/event3  KEY_F1 (59)  = PTT press/release
+ *
+ *   REMOTE (UDP → porto-watchdog server container):
+ *     /dev/input/event3  KEY_F2 (60)  = Ident broadcast
+ *     /dev/input/event3  KEY_F3 (61)  = Emergency broadcast
+ *     /dev/input/event4  KEY_F13 (183) = Previous channel
+ *     /dev/input/event4  KEY_F14 (184) = Next channel
+ *
+ * The binary is launched on boot by pttbridge.apk and stays resident.
+ * If /data/local/tmp/knob.conf exists, remote watchdog features are
+ * enabled. Otherwise it runs in PTT-only mode.
+ *
+ * Packet format (45 bytes, HMAC-SHA256 signed):
+ *   [0]      command: 'N'/'P'/'E'/'I'
  *   [1..8]   radio_id: 8-char identifier (null-padded)
  *   [9..12]  timestamp: uint32 big-endian (unix epoch)
  *   [13..44] HMAC-SHA256 over bytes [0..12]
  *
- * Usage: knob_reader <bot_host> <bot_port> <radio_id> <secret>
- * Example: knob_reader 192.168.1.100 4378 radio01 mySecretKey123
- *
- * Or with config file:
- *   knob_reader -f /data/local/tmp/knob.conf
- *
- * Config file format (one key=value per line):
- *   host=192.168.1.100
- *   port=4378
- *   radio_id=radio01
- *   secret=mySecretKey123
- *   device=/dev/input/event4
- *   button_device=/dev/input/event3
- *
- * Build: arm-linux-gnueabihf-gcc -static -o knob_reader knob_reader.c
+ * Build: arm-linux-gnueabihf-gcc -static -o porto-watchdog knob_reader.c
  *
  * License: GPLv3
  */
@@ -40,6 +38,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/input.h>
@@ -155,27 +154,32 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 
 /* ---- End crypto ---- */
 
-/* TE300K knob keycodes (channel-switch on /dev/input/event4) */
-#define KNOB_CW         184   /* KEY_F14 = clockwise = next */
-#define KNOB_CCW        183   /* KEY_F13 = counter-clockwise = prev */
+/* TE300K keycodes */
+#define KEY_PTT         59    /* KEY_F1 = PTT button (event3) */
+#define BTN_IDENT       60    /* KEY_F2 = side/ident button (event3) */
+#define BTN_EMERGENCY   61    /* KEY_F3 = emergency button (event3) */
+#define KNOB_CCW        183   /* KEY_F13 = knob counter-clockwise (event4) */
+#define KNOB_CW         184   /* KEY_F14 = knob clockwise (event4) */
 
-/* TE300K button keycodes (gpio-keys on /dev/input/event3) */
-#define BTN_EMERGENCY   61    /* KEY_F3 = emergency button */
-#define BTN_IDENT       60    /* KEY_F2 = side/ident button */
-
-/* Packet constants */
+/* UDP packet constants */
 #define PKT_SIZE        45
 #define RADIO_ID_LEN    8
 #define HMAC_OFFSET     13
 #define PAYLOAD_LEN     13
 
-/* Command bytes */
+/* Command bytes (UDP) */
 #define CMD_NEXT        'N'
 #define CMD_PREV        'P'
 #define CMD_EMERGENCY   'E'
 #define CMD_IDENT       'I'
 
 #define DEBOUNCE_MS     150
+
+/* PTT socket name (abstract namespace, must match pttbridge.apk) */
+#define PTT_SOCKET_NAME "ptt_bridge"
+
+/* Default config path (auto-loaded if no args given) */
+#define DEFAULT_CONFIG  "/data/local/tmp/knob.conf"
 
 /* Config */
 static char cfg_host[256]  = "";
@@ -185,11 +189,47 @@ static char cfg_secret[256] = "";
 static char cfg_device[256] = "/dev/input/event4";
 static char cfg_button_device[256] = "/dev/input/event3";
 
+static int udp_enabled = 0;  /* set to 1 if config loaded successfully */
+
 static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+
+/* ---- PTT socket ---- */
+
+static int ptt_connect(void) {
+    int fd;
+    struct sockaddr_un addr;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    /* Abstract namespace: first byte is \0, then the name */
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, PTT_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+
+    /* offsetof(sun_path) + 1 + strlen(name) */
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(PTT_SOCKET_NAME);
+
+    if (connect(fd, (struct sockaddr *)&addr, len) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int ptt_send(int fd, int pressed) {
+    char msg = pressed ? '1' : '0';
+    ssize_t n = write(fd, &msg, 1);
+    if (n <= 0) return -1;
+    return 0;
+}
+
+/* ---- UDP packet ---- */
 
 static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
     unsigned int ts;
@@ -207,9 +247,9 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
                 pkt, PAYLOAD_LEN, pkt + HMAC_OFFSET);
 }
 
-static int send_command(int sock_fd, struct sockaddr_in *dest,
-                        unsigned char pkt[PKT_SIZE], char cmd,
-                        const char *label, long long *last_send) {
+static int send_udp_command(int sock_fd, struct sockaddr_in *dest,
+                            unsigned char pkt[PKT_SIZE], char cmd,
+                            const char *label, long long *last_send) {
     long long now = now_ms();
     if (now - *last_send < DEBOUNCE_MS) return 0;
     *last_send = now;
@@ -219,15 +259,17 @@ static int send_command(int sock_fd, struct sockaddr_in *dest,
         fprintf(stderr, "sendto: %s\n", strerror(errno));
         return -1;
     }
-    printf("knob_reader: %s (%s)\n", label, cfg_radio_id);
+    printf("porto-watchdog: %s (%s)\n", label, cfg_radio_id);
     fflush(stdout);
     return 1;
 }
 
-static void load_config(const char *path) {
+/* ---- Config file ---- */
+
+static int load_config(const char *path) {
     FILE *f = fopen(path, "r");
     char line[512], key[64], val[256];
-    if (!f) { fprintf(stderr, "Cannot open config: %s\n", path); exit(1); }
+    if (!f) return 0;  /* not found = not an error, just no UDP */
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         if (sscanf(line, " %63[^=]=%255[^\r\n]", key, val) == 2) {
@@ -240,10 +282,11 @@ static void load_config(const char *path) {
         }
     }
     fclose(f);
+    return 1;
 }
 
 int main(int argc, char *argv[]) {
-    int knob_fd, btn_fd, sock_fd;
+    int btn_fd, knob_fd = -1, udp_fd = -1, ptt_fd = -1;
     struct sockaddr_in dest;
     struct input_event ev;
     long long last_knob_send = 0;
@@ -251,82 +294,111 @@ int main(int argc, char *argv[]) {
     unsigned char pkt[PKT_SIZE];
     struct pollfd fds[2];
     int nfds;
+    int config_loaded = 0;
+    int ptt_connected = 0;
 
+    /* Load config: explicit -f, or auto-detect default path */
     if (argc == 3 && strcmp(argv[1], "-f") == 0) {
-        load_config(argv[2]);
-    } else if (argc == 5) {
-        strncpy(cfg_host, argv[1], sizeof(cfg_host)-1);
-        cfg_port = atoi(argv[2]);
-        strncpy(cfg_radio_id, argv[3], RADIO_ID_LEN);
-        strncpy(cfg_secret, argv[4], sizeof(cfg_secret)-1);
+        config_loaded = load_config(argv[2]);
+        if (!config_loaded) {
+            fprintf(stderr, "Cannot open config: %s\n", argv[2]);
+            return 1;
+        }
+    } else if (argc == 1) {
+        /* No args: try default config path silently */
+        config_loaded = load_config(DEFAULT_CONFIG);
     } else {
         fprintf(stderr,
+            "porto-watchdog: TE300K local watchdog daemon\n"
             "Usage:\n"
-            "  %s <host> <port> <radio_id> <secret>\n"
-            "  %s -f <config_file>\n", argv[0], argv[0]);
+            "  %s              (auto-loads %s if present)\n"
+            "  %s -f <config>  (explicit config path)\n",
+            argv[0], DEFAULT_CONFIG, argv[0]);
         return 1;
     }
 
-    if (!cfg_host[0] || !cfg_radio_id[0] || !cfg_secret[0]) {
-        fprintf(stderr, "Error: host, radio_id, and secret are required\n");
-        return 1;
+    /* Check if UDP is viable */
+    if (config_loaded && cfg_host[0] && cfg_radio_id[0] && cfg_secret[0]) {
+        udp_enabled = 1;
     }
 
-    /* Open knob device */
-    knob_fd = open(cfg_device, O_RDONLY);
-    if (knob_fd < 0) {
-        fprintf(stderr, "Cannot open knob device %s: %s\n",
-                cfg_device, strerror(errno));
-        return 1;
-    }
-
-    /* Open button device (optional) */
+    /* Open button/PTT device (event3) - required for PTT */
     btn_fd = open(cfg_button_device, O_RDONLY);
     if (btn_fd < 0) {
-        fprintf(stderr, "Warning: cannot open button device %s: %s "
-                "(emergency/ident disabled)\n",
-                cfg_button_device, strerror(errno));
-    }
-
-    /* UDP socket */
-    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
-        perror("socket");
-        close(knob_fd);
-        if (btn_fd >= 0) close(btn_fd);
+        fprintf(stderr, "Cannot open %s: %s\n", cfg_button_device, strerror(errno));
         return 1;
     }
 
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(cfg_port);
-    if (inet_aton(cfg_host, &dest.sin_addr) == 0) {
-        fprintf(stderr, "Invalid address: %s\n", cfg_host);
-        close(knob_fd);
-        if (btn_fd >= 0) close(btn_fd);
-        close(sock_fd);
-        return 1;
+    /* Open knob device (event4) - optional */
+    knob_fd = open(cfg_device, O_RDONLY);
+    if (knob_fd < 0) {
+        fprintf(stderr, "Warning: cannot open knob %s: %s (channel switch disabled)\n",
+                cfg_device, strerror(errno));
     }
 
-    printf("knob_reader: knob=%s buttons=%s radio=%s\n",
-           cfg_device,
-           btn_fd >= 0 ? cfg_button_device : "(disabled)",
-           cfg_radio_id);
-    printf("knob_reader: target=%s:%d (HMAC-SHA256)\n", cfg_host, cfg_port);
-    printf("knob_reader: commands: N(ext) P(rev) E(mergency) I(dent)\n");
+    /* Connect PTT socket (retry on failure, service may not be up yet) */
+    {
+        int retries;
+        for (retries = 0; retries < 30; retries++) {
+            ptt_fd = ptt_connect();
+            if (ptt_fd >= 0) {
+                ptt_connected = 1;
+                break;
+            }
+            if (retries == 0)
+                fprintf(stderr, "porto-watchdog: waiting for PTT socket service...\n");
+            usleep(500000); /* 500ms */
+        }
+        if (!ptt_connected) {
+            fprintf(stderr, "Warning: PTT socket not available (PTT disabled)\n");
+        }
+    }
+
+    /* Set up UDP socket if config is valid */
+    if (udp_enabled) {
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd < 0) {
+            perror("UDP socket");
+            udp_enabled = 0;
+        } else {
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(cfg_port);
+            if (inet_aton(cfg_host, &dest.sin_addr) == 0) {
+                fprintf(stderr, "Invalid address: %s\n", cfg_host);
+                close(udp_fd);
+                udp_enabled = 0;
+            }
+        }
+    }
+
+    /* Startup banner */
+    printf("porto-watchdog: TE300K all-in-one handler\n");
+    printf("porto-watchdog: buttons=%s (PTT%s%s%s)\n",
+           cfg_button_device,
+           ptt_connected ? " [OK]" : " [N/A]",
+           udp_enabled ? " emergency ident" : "",
+           udp_enabled ? " [OK]" : "");
+    if (knob_fd >= 0)
+        printf("porto-watchdog: knob=%s (channel switch%s)\n",
+               cfg_device, udp_enabled ? " [OK]" : " [N/A]");
+    if (udp_enabled)
+        printf("porto-watchdog: UDP target=%s:%d radio=%s\n",
+               cfg_host, cfg_port, cfg_radio_id);
     fflush(stdout);
 
-    /* Set up poll */
-    fds[0].fd = knob_fd;
+    /* Set up poll: always have btn_fd, optionally knob_fd */
+    fds[0].fd = btn_fd;
     fds[0].events = POLLIN;
     nfds = 1;
 
-    if (btn_fd >= 0) {
-        fds[1].fd = btn_fd;
+    if (knob_fd >= 0) {
+        fds[1].fd = knob_fd;
         fds[1].events = POLLIN;
         nfds = 2;
     }
 
+    /* Main event loop */
     while (1) {
         int ret = poll(fds, nfds, -1);
         if (ret < 0) {
@@ -335,45 +407,69 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* Knob events (event4: channel-switch) */
+        /* Button events: event3 (gpio-keys) */
         if (fds[0].revents & POLLIN) {
-            ssize_t n = read(knob_fd, &ev, sizeof(ev));
-            if (n < (ssize_t)sizeof(ev)) {
-                if (n < 0 && errno == EINTR) continue;
-                fprintf(stderr, "Knob read error: %s\n", strerror(errno));
-                break;
-            }
-            if (ev.type == EV_KEY && ev.value == 1) {
-                if (ev.code == KNOB_CW)
-                    send_command(sock_fd, &dest, pkt, CMD_NEXT,
-                                 "NEXT", &last_knob_send);
-                else if (ev.code == KNOB_CCW)
-                    send_command(sock_fd, &dest, pkt, CMD_PREV,
-                                 "PREV", &last_knob_send);
-            }
-        }
-
-        /* Button events (event3: gpio-keys) */
-        if (nfds > 1 && (fds[1].revents & POLLIN)) {
             ssize_t n = read(btn_fd, &ev, sizeof(ev));
             if (n < (ssize_t)sizeof(ev)) {
                 if (n < 0 && errno == EINTR) continue;
                 fprintf(stderr, "Button read error: %s\n", strerror(errno));
                 break;
             }
-            if (ev.type == EV_KEY && ev.value == 1) {
-                if (ev.code == BTN_EMERGENCY)
-                    send_command(sock_fd, &dest, pkt, CMD_EMERGENCY,
-                                 "EMERGENCY", &last_btn_send);
-                else if (ev.code == BTN_IDENT)
-                    send_command(sock_fd, &dest, pkt, CMD_IDENT,
-                                 "IDENT", &last_btn_send);
+
+            if (ev.type == EV_KEY) {
+                /* PTT: send both press (1) and release (0) */
+                if (ev.code == KEY_PTT && (ev.value == 1 || ev.value == 0)) {
+                    if (ptt_connected) {
+                        if (ptt_send(ptt_fd, ev.value) < 0) {
+                            /* Socket died, try reconnecting */
+                            close(ptt_fd);
+                            ptt_fd = ptt_connect();
+                            if (ptt_fd >= 0) {
+                                ptt_send(ptt_fd, ev.value);
+                            } else {
+                                ptt_connected = 0;
+                                fprintf(stderr, "porto-watchdog: PTT socket lost\n");
+                            }
+                        }
+                        printf("porto-watchdog: PTT %s\n",
+                               ev.value ? "DOWN" : "UP");
+                        fflush(stdout);
+                    }
+                }
+                /* Emergency & Ident: only on press (value 1), only if UDP enabled */
+                else if (ev.value == 1 && udp_enabled) {
+                    if (ev.code == BTN_EMERGENCY)
+                        send_udp_command(udp_fd, &dest, pkt, CMD_EMERGENCY,
+                                         "EMERGENCY", &last_btn_send);
+                    else if (ev.code == BTN_IDENT)
+                        send_udp_command(udp_fd, &dest, pkt, CMD_IDENT,
+                                         "IDENT", &last_btn_send);
+                }
+            }
+        }
+
+        /* Knob events: event4 (channel-switch) */
+        if (nfds > 1 && (fds[1].revents & POLLIN)) {
+            ssize_t n = read(knob_fd, &ev, sizeof(ev));
+            if (n < (ssize_t)sizeof(ev)) {
+                if (n < 0 && errno == EINTR) continue;
+                fprintf(stderr, "Knob read error: %s\n", strerror(errno));
+                break;
+            }
+            if (ev.type == EV_KEY && ev.value == 1 && udp_enabled) {
+                if (ev.code == KNOB_CW)
+                    send_udp_command(udp_fd, &dest, pkt, CMD_NEXT,
+                                     "NEXT", &last_knob_send);
+                else if (ev.code == KNOB_CCW)
+                    send_udp_command(udp_fd, &dest, pkt, CMD_PREV,
+                                     "PREV", &last_knob_send);
             }
         }
     }
 
-    close(sock_fd);
-    close(knob_fd);
-    if (btn_fd >= 0) close(btn_fd);
+    if (udp_fd >= 0) close(udp_fd);
+    if (ptt_fd >= 0) close(ptt_fd);
+    if (knob_fd >= 0) close(knob_fd);
+    close(btn_fd);
     return 0;
 }

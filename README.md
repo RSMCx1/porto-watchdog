@@ -26,12 +26,12 @@ Two watchdogs work together:
 
 ```
   TE300K Radio (runs in background after boot)
-  ┌───────────────────────────────────────────────┐
-  │                                               │
-  │  PTT (F1)   Ident (F2)   Emergency (F3)      │
-  │  Knob CW (F14)     Knob CCW (F13)            │
-  │       │         │         │                   │
-  │  ┌────┴─────────┴─────────┴────────────────┐  │
+  ┌────────────────────────────────────────────────┐
+  │                                                │
+  │  PTT (F1)   Ident (F2)   Emergency (F3)        │
+  │  Knob CW (F14)     Knob CCW (F13)              │
+  │       │         │         │                    │
+  │  ┌────┴─────────┴─────────┴────────────────┐   │
   │  │    porto-watchdog (local watchdog)       │  │
   │  │    background daemon on the radio        │  │
   │  │                                          │  │

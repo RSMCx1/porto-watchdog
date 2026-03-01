@@ -135,6 +135,8 @@ Persists across reboots. Only needed once per device.
 
 **2b. Install the apps**
 
+`pttbridge.apk` is included in this repo. Mumla is a separate download.
+
 ```bash
 adb install pttbridge.apk
 adb install mumla.apk

@@ -99,11 +99,8 @@ adb shell "nohup /data/local/tmp/knob_reader -f /data/local/tmp/knob.conf >/dev/
 
 Each radio gets its own `knob.conf` with a unique `radio_id` but the SAME `secret`.
 
-Download the latest `knob_reader` ARM binary from
-[GitHub Actions artifacts](../../actions) or build from source:
-```bash
-arm-linux-gnueabihf-gcc -static -o knob_reader knob_reader.c
-```
+The `knob_reader` ARM binary is built automatically by CI — download it from
+the [Actions](../../actions) tab (artifact: `knob_reader-arm`).
 
 ### 4. Mumble ACL
 

@@ -24,12 +24,22 @@ import logging
 import socket
 import fnmatch
 
-try:
-    import pymumble_py3 as pymumble
-    from pymumble_py3.messages import MoveCmd
-except ImportError:
-    print("ERROR: pymumble not found. Install with: pip install pymumble")
-    sys.exit(1)
+pymumble = None
+MoveCmd = None
+
+
+def _load_pymumble():
+    global pymumble, MoveCmd
+    if pymumble is not None:
+        return
+    try:
+        import pymumble_py3
+        from pymumble_py3.messages import MoveCmd as _MoveCmd
+        pymumble = pymumble_py3
+        MoveCmd = _MoveCmd
+    except ImportError:
+        print("ERROR: pymumble not found. Install with: pip install pymumble")
+        sys.exit(1)
 
 log = logging.getLogger('channel-bot')
 
@@ -205,6 +215,7 @@ class ChannelBot:
             )
 
     def connect_mumble(self):
+        _load_pymumble()
         host = self.config['mumble_host']
         port = self.config['mumble_port']
         username = self.config['bot_username']

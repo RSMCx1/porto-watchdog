@@ -1,6 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.9-slim
 
-RUN pip install --no-cache-dir pymumble
+RUN pip install --no-cache-dir pymumble protobuf
 
 WORKDIR /app
 COPY channel_bot.py .

@@ -1,34 +1,16 @@
 services:
   # -------------------------------------------------------------------------
-  # Your existing Mumble server (example - adjust to match YOUR config)
-  # If adding to an existing stack, skip this - you already have it
-  # -------------------------------------------------------------------------
-  murmur:
-    image: mumblevoip/mumble-server:latest
-    container_name: murmur
-    ports:
-      - "64738:64738/tcp"
-      - "64738:64738/udp"
-    volumes:
-      - murmur-data:/data
-    restart: unless-stopped
-
-  # -------------------------------------------------------------------------
-  # >>> ADD THIS TO YOUR EXISTING STACK <<<
+  # Channel bot - add this to your existing Mumble stack
   # All config via environment variables - no config files needed
   # -------------------------------------------------------------------------
   channel-bot:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    # Or use the pre-built image:
-    # image: rsmcx1/porto-watchdog:latest
+    image: rsmcx1/porto-watchdog:latest
     container_name: channel-bot
     ports:
       - "4378:4378/udp"
     environment:
       # -- Mumble server --
-      MUMBLE_HOST: murmur
+      MUMBLE_HOST: zip-mumble-server
       MUMBLE_PORT: "64738"
       BOT_USERNAME: ChannelBot
       BOT_PASSWORD: ""
@@ -63,9 +45,4 @@ services:
       # Format: radio_id=mumla_username (comma-separated, wildcards supported)
       # Examples: "radio01=TE300K" or "radio01=P*" (matches any user starting with P)
       RADIOS: "radio01=TE300K"
-    depends_on:
-      - murmur
     restart: unless-stopped
-
-volumes:
-  murmur-data:

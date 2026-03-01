@@ -323,22 +323,64 @@ int main(int argc, char *argv[]) {
         udp_enabled = 1;
     }
 
-    /* Open button/PTT device (event3) - required for PTT */
-    btn_fd = open(cfg_button_device, O_RDONLY);
-    if (btn_fd < 0) {
-        fprintf(stderr, "Cannot open %s: %s\n", cfg_button_device, strerror(errno));
-        return 1;
+    /*
+     * Boot-resilient startup sequence:
+     *   1. Wait for input devices (kernel may not have initialized them yet)
+     *   2. Connect PTT socket (local, wait for APK service)
+     *   3. Resolve DNS / set up UDP (wait for network — slowest)
+     */
+
+    /* 1. Open button/PTT device (event3) - retry at boot */
+    {
+        int retries;
+        for (retries = 0; retries < 60; retries++) {
+            btn_fd = open(cfg_button_device, O_RDONLY);
+            if (btn_fd >= 0) break;
+            if (retries == 0)
+                fprintf(stderr, "porto-watchdog: waiting for %s ...\n", cfg_button_device);
+            sleep(1);
+        }
+        if (btn_fd < 0) {
+            fprintf(stderr, "porto-watchdog: cannot open %s: %s\n",
+                    cfg_button_device, strerror(errno));
+            return 1;
+        }
     }
 
-    /* Open knob device (event4) - optional */
-    knob_fd = open(cfg_device, O_RDONLY);
-    if (knob_fd < 0) {
-        fprintf(stderr, "Warning: cannot open knob %s: %s (channel switch disabled)\n",
-                cfg_device, strerror(errno));
+    /* Open knob device (event4) - optional, also retry briefly */
+    {
+        int retries;
+        for (retries = 0; retries < 10; retries++) {
+            knob_fd = open(cfg_device, O_RDONLY);
+            if (knob_fd >= 0) break;
+            if (retries == 0)
+                fprintf(stderr, "porto-watchdog: waiting for %s ...\n", cfg_device);
+            sleep(1);
+        }
+        if (knob_fd < 0)
+            fprintf(stderr, "porto-watchdog: knob %s not available (channel switch disabled)\n",
+                    cfg_device);
     }
 
-    /* Set up UDP socket if config is valid (retry until network is ready) */
-    /* Do this BEFORE PTT connect so network wait doesn't eat PTT retries */
+    /* 2. Connect PTT socket (retry — APK service may still be starting) */
+    {
+        int retries;
+        for (retries = 0; retries < 60; retries++) {
+            ptt_fd = ptt_connect();
+            if (ptt_fd >= 0) {
+                ptt_connected = 1;
+                break;
+            }
+            if (retries == 0)
+                fprintf(stderr, "porto-watchdog: waiting for PTT socket service...\n");
+            usleep(500000); /* 500ms */
+        }
+        if (!ptt_connected) {
+            fprintf(stderr, "porto-watchdog: PTT socket not available yet (will retry on keypress)\n");
+        }
+    }
+
+    /* 3. Set up UDP socket and resolve remote watchdog (retry until network is ready) */
     if (udp_enabled) {
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (udp_fd < 0) {
@@ -372,24 +414,6 @@ int main(int argc, char *argv[]) {
                 close(udp_fd);
                 udp_enabled = 0;
             }
-        }
-    }
-
-    /* Connect PTT socket (retry on failure, service may not be up yet) */
-    {
-        int retries;
-        for (retries = 0; retries < 60; retries++) {
-            ptt_fd = ptt_connect();
-            if (ptt_fd >= 0) {
-                ptt_connected = 1;
-                break;
-            }
-            if (retries == 0)
-                fprintf(stderr, "porto-watchdog: waiting for PTT socket service...\n");
-            usleep(500000); /* 500ms */
-        }
-        if (!ptt_connected) {
-            fprintf(stderr, "porto-watchdog: PTT socket not available yet (will retry on keypress)\n");
         }
     }
 

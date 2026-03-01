@@ -59,12 +59,31 @@ VALID_COMMANDS = ('N', 'P', 'E', 'I')
 # ============================================================================
 # Packet verification
 # ============================================================================
-def verify_packet(data, secret):
+def get_secret_for_radio(config, radio_id):
+    """Return the secret for a given radio_id.
+    Per-radio SECRETS take precedence over global SECRET.
+    """
+    if config['secrets'].get(radio_id):
+        return config['secrets'][radio_id]
+    if config['secret']:
+        return config['secret']
+    return None
+
+
+def verify_packet(data, config):
     """Verify and parse a signed packet.
     Returns (command, radio_id) or (None, None) on failure.
     """
     if len(data) != PKT_SIZE:
         log.debug("Bad packet size: %d", len(data))
+        return None, None
+
+    # Extract radio_id before HMAC check (used only as key lookup)
+    radio_id = data[1:1 + RADIO_ID_LEN].rstrip(b'\x00').decode('ascii', errors='replace')
+
+    secret = get_secret_for_radio(config, radio_id)
+    if secret is None:
+        log.warning("No secret configured for radio '%s'", radio_id)
         return None, None
 
     payload = data[:PAYLOAD_LEN]
@@ -77,11 +96,10 @@ def verify_packet(data, secret):
     ).digest()
 
     if not hmac.compare_digest(received_hmac, expected_hmac):
-        log.warning("HMAC verification failed - invalid secret or tampered packet")
+        log.warning("HMAC verification failed (radio=%s)", radio_id)
         return None, None
 
     cmd = chr(data[0])
-    radio_id = data[1:1 + RADIO_ID_LEN].rstrip(b'\x00').decode('ascii', errors='replace')
     timestamp = struct.unpack('>I', data[9:13])[0]
 
     now = int(time.time())
@@ -206,7 +224,6 @@ class ChannelBot:
         self.debounce_ms = 200
 
         self.radio_map = config['radios']
-        self.secret = config['secret']
         self.allowed_ips = set()
 
         if config['allowed_ips'].strip():
@@ -281,7 +298,7 @@ class ChannelBot:
             log.warning("Rejected packet from non-allowed IP: %s", addr[0])
             return
 
-        cmd, radio_id = verify_packet(data, self.secret)
+        cmd, radio_id = verify_packet(data, self.config)
         if cmd is None:
             return
 
@@ -324,11 +341,12 @@ class ChannelBot:
         log.info("Radio -> User mapping:")
         for rid, uname in self.radio_map.items():
             user = self.channel_mgr.find_user_by_name(uname)
+            key_type = "own key" if rid in self.config['secrets'] else "shared key"
             if user:
-                status = f"channel {user['channel_id']}"
+                status = f"channel {user['channel_id']}, {key_type}"
                 display = f"{uname} -> {user['name']}" if uname != user['name'] else uname
             else:
-                status = "NOT CONNECTED"
+                status = f"NOT CONNECTED, {key_type}"
                 display = uname
             log.info("  %s -> %s (%s)", rid, display, status)
 
@@ -398,7 +416,6 @@ def load_env_config():
     }
 
     # Parse RADIOS: "radio01=TE300K,radio02=P*"
-    # Supports fnmatch wildcards in usernames (e.g. P* matches any user starting with P)
     config['radios'] = {}
     radios_str = os.environ.get('RADIOS', '')
     if radios_str.strip():
@@ -407,6 +424,17 @@ def load_env_config():
             if '=' in pair:
                 radio_id, mumla_user = pair.split('=', 1)
                 config['radios'][radio_id.strip()] = mumla_user.strip()
+
+    # Parse SECRETS: "radio01=secretA,radio02=secretB" (per-radio keys)
+    # Per-radio secrets take precedence over global SECRET fallback
+    config['secrets'] = {}
+    secrets_str = os.environ.get('SECRETS', '')
+    if secrets_str.strip():
+        for pair in secrets_str.split(','):
+            pair = pair.strip()
+            if '=' in pair:
+                radio_id, secret = pair.split('=', 1)
+                config['secrets'][radio_id.strip()] = secret.strip()
 
     return config
 
@@ -424,8 +452,15 @@ def main():
         import secrets
         s = secrets.token_urlsafe(32)
         print(f"Generated secret: {s}")
-        print("Set this as SECRET env var in docker-compose.yml")
-        print("and in each radio's knob.conf secret=")
+        print()
+        print("Option A — shared secret (all radios use the same key):")
+        print(f"  SECRET=\"{s}\"")
+        print()
+        print("Option B — per-radio secrets (generate one per radio):")
+        print(f"  SECRETS=\"radio01={s}\"")
+        print("  Run --gen-secret again for each additional radio.")
+        print()
+        print("Set in docker-compose.yml and in each radio's knob.conf secret=")
         return
 
     config = load_env_config()
@@ -436,8 +471,8 @@ def main():
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
 
-    if not config['secret']:
-        log.error("No SECRET env var set! Run with --gen-secret to create one.")
+    if not config['secret'] and not config['secrets']:
+        log.error("No SECRET or SECRETS env var set! Run with --gen-secret to create one.")
         sys.exit(1)
 
     if not config['radios']:

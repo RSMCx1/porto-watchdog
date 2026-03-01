@@ -17,7 +17,11 @@ services:
 
       # -- Security --
       # Generate with: docker run --rm rsmcx1/porto-watchdog --gen-secret
+      # Option A: shared secret (all radios use this key)
       SECRET: "CHANGE_ME_GENERATE_A_REAL_SECRET"
+      # Option B: per-radio secrets (overrides SECRET for listed radios)
+      # Allows revoking a compromised radio without re-keying others
+      # SECRETS: "radio01=secretA,radio02=secretB"
       # Optional: restrict source IPs (comma-separated, empty = any)
       ALLOWED_IPS: ""
 

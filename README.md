@@ -79,13 +79,15 @@ the remote watchdog, which executes them on the Mumble server.
 
 Do this once on your server.
 
-**1a. Generate a shared secret**
+**1a. Generate secrets**
 
 ```bash
 docker run --rm rsmcx1/porto-watchdog --gen-secret
 ```
 
-Save the output. Every radio and the server must use the same secret.
+You can use one shared secret for all radios (`SECRET`), or generate a
+separate secret per radio (`SECRETS`) so you can revoke a compromised
+radio without re-keying the others.
 
 **1b. Add porto-watchdog to your Docker stack**
 
@@ -95,7 +97,10 @@ The three variables you must set:
 ```yaml
 environment:
   MUMBLE_HOST: your-mumble-container-name
+  # Option A: one shared secret for all radios
   SECRET: "the-secret-from-step-1a"
+  # Option B: per-radio secrets (revoke one without affecting others)
+  # SECRETS: "radio01=secretA,radio02=secretB"
   RADIOS: "radio01=TE300K,radio02=TE300K-2"
 ```
 
@@ -143,7 +148,9 @@ device=/dev/input/event4   # knob input (don't change)
 button_device=/dev/input/event3  # button input (don't change)
 ```
 
-Each radio needs a **unique `radio_id`** but the **same `secret`**.
+Each radio needs a **unique `radio_id`**. The `secret` must match what
+the server has — either the shared `SECRET` or that radio's entry in
+`SECRETS`.
 
 **2d. Push files to the radio**
 
@@ -214,7 +221,8 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `MUMBLE_PORT` | 64738 | Mumble server port |
 | `BOT_USERNAME` | ChannelBot | Bot display name in Mumble |
 | `BOT_PASSWORD` | *(empty)* | Bot password |
-| `SECRET` | *(required)* | HMAC shared secret |
+| `SECRET` | *(required)* | HMAC shared secret (fallback for all radios) |
+| `SECRETS` | *(empty)* | Per-radio secrets: `radio01=key1,radio02=key2` |
 | `ALLOWED_IPS` | *(empty=any)* | Source IP allowlist |
 | `UDP_PORT` | 4378 | UDP listen port |
 | `UDP_ADDR` | 0.0.0.0 | UDP bind address |
@@ -235,11 +243,17 @@ All key events forwarded to the remote watchdog are authenticated.
 | Layer | How |
 |-------|-----|
 | Authentication | Every UDP packet signed with HMAC-SHA256 |
+| Per-radio keys | Optional per-radio secrets via `SECRETS` env var |
 | Replay protection | Packets expire after 30 seconds |
 | IP allowlist | Optional `ALLOWED_IPS` env var |
 | Per-radio identity | 8-char radio ID in every packet |
 
 Unsigned or expired packets are silently dropped.
+
+**Revoking a compromised radio:** If using per-radio secrets (`SECRETS`),
+remove or replace that radio's entry and restart the container. All other
+radios keep working. If using a shared secret (`SECRET`), all radios
+must be re-keyed.
 
 ## Files
 
@@ -269,7 +283,8 @@ radio's network. Check UDP port 4378 is open. Check remote watchdog
 container logs.
 
 **"HMAC verification failed"** —
-`secret` in `knob.conf` and `SECRET` env var must be identical.
+`secret` in `knob.conf` must match the server's `SECRET` or that
+radio's entry in `SECRETS`.
 
 **"Replay rejected"** —
 Radio clock is off. Check: `adb shell date`

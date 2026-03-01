@@ -5,15 +5,19 @@
 # IP of the machine running channel_bot.py (your Docker host)
 host=192.168.1.100
 
-# UDP port (must match bot_config.ini [udp] listen_port)
+# UDP port (must match UDP_PORT in docker-compose.yml)
 port=4378
 
-# Unique ID for this radio (max 8 chars, must match [radios] in bot_config.ini)
+# Unique ID for this radio (max 8 chars, must match RADIOS env var)
 radio_id=radio01
 
-# Shared secret (must match [security] secret in bot_config.ini)
+# Shared secret (must match SECRET env var in docker-compose.yml)
 # Generate with: python3 channel_bot.py --gen-secret
 secret=CHANGE_ME_GENERATE_A_REAL_SECRET
 
-# Input device (TE300K knob)
+# Input device - rotary knob (TE300K channel switch)
 device=/dev/input/event4
+
+# Input device - side buttons (KEY_F2=ident, KEY_F3=emergency)
+# Remove or leave empty to disable buttons
+button_device=/dev/input/event3

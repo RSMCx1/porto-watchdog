@@ -1,11 +1,12 @@
 /*
- * knob_reader - TE300K rotary knob → authenticated UDP channel switch
- * ====================================================================
- * Reads /dev/input/event4 ("channel-switch") and sends HMAC-signed
- * UDP packets to the channel switcher bot.
+ * knob_reader - TE300K rotary knob + buttons -> authenticated UDP
+ * ================================================================
+ * Reads /dev/input/event4 ("channel-switch") for knob rotation and
+ * /dev/input/event3 ("gpio-keys") for emergency/ident buttons.
+ * Sends HMAC-signed UDP packets to the channel switcher bot.
  *
  * Packet format (45 bytes):
- *   [0]      command: 'N' (next) or 'P' (prev)
+ *   [0]      command: 'N' (next), 'P' (prev), 'E' (emergency), 'I' (ident)
  *   [1..8]   radio_id: 8-char identifier (null-padded)
  *   [9..12]  timestamp: uint32 big-endian (unix epoch)
  *   [13..44] HMAC-SHA256 over bytes [0..12]
@@ -22,6 +23,7 @@
  *   radio_id=radio01
  *   secret=mySecretKey123
  *   device=/dev/input/event4
+ *   button_device=/dev/input/event3
  *
  * Build: arm-linux-gnueabihf-gcc -static -o knob_reader knob_reader.c
  *
@@ -35,6 +37,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -152,9 +155,13 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 
 /* ---- End crypto ---- */
 
-/* TE300K knob keycodes */
-#define KNOB_CW         184   /* KEY_F14 = clockwise */
-#define KNOB_CCW        183   /* KEY_F13 = counter-clockwise */
+/* TE300K knob keycodes (channel-switch on /dev/input/event4) */
+#define KNOB_CW         184   /* KEY_F14 = clockwise = next */
+#define KNOB_CCW        183   /* KEY_F13 = counter-clockwise = prev */
+
+/* TE300K button keycodes (gpio-keys on /dev/input/event3) */
+#define BTN_EMERGENCY   61    /* KEY_F3 = emergency button */
+#define BTN_IDENT       60    /* KEY_F2 = side/ident button */
 
 /* Packet constants */
 #define PKT_SIZE        45
@@ -162,8 +169,12 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 #define HMAC_OFFSET     13
 #define PAYLOAD_LEN     13
 
+/* Command bytes */
 #define CMD_NEXT        'N'
 #define CMD_PREV        'P'
+#define CMD_EMERGENCY   'E'
+#define CMD_IDENT       'I'
+
 #define DEBOUNCE_MS     150
 
 /* Config */
@@ -172,6 +183,7 @@ static int  cfg_port       = 4378;
 static char cfg_radio_id[RADIO_ID_LEN + 1] = "";
 static char cfg_secret[256] = "";
 static char cfg_device[256] = "/dev/input/event4";
+static char cfg_button_device[256] = "/dev/input/event3";
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -195,6 +207,23 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
                 pkt, PAYLOAD_LEN, pkt + HMAC_OFFSET);
 }
 
+static int send_command(int sock_fd, struct sockaddr_in *dest,
+                        unsigned char pkt[PKT_SIZE], char cmd,
+                        const char *label, long long *last_send) {
+    long long now = now_ms();
+    if (now - *last_send < DEBOUNCE_MS) return 0;
+    *last_send = now;
+    build_packet(pkt, cmd);
+    if (sendto(sock_fd, pkt, PKT_SIZE, 0,
+               (struct sockaddr *)dest, sizeof(*dest)) < 0) {
+        fprintf(stderr, "sendto: %s\n", strerror(errno));
+        return -1;
+    }
+    printf("knob_reader: %s (%s)\n", label, cfg_radio_id);
+    fflush(stdout);
+    return 1;
+}
+
 static void load_config(const char *path) {
     FILE *f = fopen(path, "r");
     char line[512], key[64], val[256];
@@ -207,17 +236,21 @@ static void load_config(const char *path) {
             else if (strcmp(key, "radio_id") == 0) strncpy(cfg_radio_id, val, RADIO_ID_LEN);
             else if (strcmp(key, "secret") == 0) strncpy(cfg_secret, val, sizeof(cfg_secret)-1);
             else if (strcmp(key, "device") == 0) strncpy(cfg_device, val, sizeof(cfg_device)-1);
+            else if (strcmp(key, "button_device") == 0) strncpy(cfg_button_device, val, sizeof(cfg_button_device)-1);
         }
     }
     fclose(f);
 }
 
 int main(int argc, char *argv[]) {
-    int input_fd, sock_fd;
+    int knob_fd, btn_fd, sock_fd;
     struct sockaddr_in dest;
     struct input_event ev;
-    long long last_send = 0;
+    long long last_knob_send = 0;
+    long long last_btn_send = 0;
     unsigned char pkt[PKT_SIZE];
+    struct pollfd fds[2];
+    int nfds;
 
     if (argc == 3 && strcmp(argv[1], "-f") == 0) {
         load_config(argv[2]);
@@ -239,57 +272,108 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    input_fd = open(cfg_device, O_RDONLY);
-    if (input_fd < 0) {
-        fprintf(stderr, "Cannot open %s: %s\n", cfg_device, strerror(errno));
+    /* Open knob device */
+    knob_fd = open(cfg_device, O_RDONLY);
+    if (knob_fd < 0) {
+        fprintf(stderr, "Cannot open knob device %s: %s\n",
+                cfg_device, strerror(errno));
         return 1;
     }
 
+    /* Open button device (optional) */
+    btn_fd = open(cfg_button_device, O_RDONLY);
+    if (btn_fd < 0) {
+        fprintf(stderr, "Warning: cannot open button device %s: %s "
+                "(emergency/ident disabled)\n",
+                cfg_button_device, strerror(errno));
+    }
+
+    /* UDP socket */
     sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) { perror("socket"); close(input_fd); return 1; }
+    if (sock_fd < 0) {
+        perror("socket");
+        close(knob_fd);
+        if (btn_fd >= 0) close(btn_fd);
+        return 1;
+    }
 
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
     dest.sin_port = htons(cfg_port);
     if (inet_aton(cfg_host, &dest.sin_addr) == 0) {
         fprintf(stderr, "Invalid address: %s\n", cfg_host);
-        close(input_fd); close(sock_fd); return 1;
+        close(knob_fd);
+        if (btn_fd >= 0) close(btn_fd);
+        close(sock_fd);
+        return 1;
     }
 
-    printf("knob_reader: device=%s radio=%s\n", cfg_device, cfg_radio_id);
+    printf("knob_reader: knob=%s buttons=%s radio=%s\n",
+           cfg_device,
+           btn_fd >= 0 ? cfg_button_device : "(disabled)",
+           cfg_radio_id);
     printf("knob_reader: target=%s:%d (HMAC-SHA256)\n", cfg_host, cfg_port);
+    printf("knob_reader: commands: N(ext) P(rev) E(mergency) I(dent)\n");
     fflush(stdout);
 
+    /* Set up poll */
+    fds[0].fd = knob_fd;
+    fds[0].events = POLLIN;
+    nfds = 1;
+
+    if (btn_fd >= 0) {
+        fds[1].fd = btn_fd;
+        fds[1].events = POLLIN;
+        nfds = 2;
+    }
+
     while (1) {
-        ssize_t n = read(input_fd, &ev, sizeof(ev));
-        if (n < (ssize_t)sizeof(ev)) {
-            if (n < 0 && errno == EINTR) continue;
-            fprintf(stderr, "Read error: %s\n", strerror(errno));
+        int ret = poll(fds, nfds, -1);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "poll: %s\n", strerror(errno));
             break;
         }
-        if (ev.type != EV_KEY || ev.value != 1) continue;
 
-        char cmd = 0;
-        if (ev.code == KNOB_CW)       cmd = CMD_NEXT;
-        else if (ev.code == KNOB_CCW)  cmd = CMD_PREV;
-        if (!cmd) continue;
+        /* Knob events (event4: channel-switch) */
+        if (fds[0].revents & POLLIN) {
+            ssize_t n = read(knob_fd, &ev, sizeof(ev));
+            if (n < (ssize_t)sizeof(ev)) {
+                if (n < 0 && errno == EINTR) continue;
+                fprintf(stderr, "Knob read error: %s\n", strerror(errno));
+                break;
+            }
+            if (ev.type == EV_KEY && ev.value == 1) {
+                if (ev.code == KNOB_CW)
+                    send_command(sock_fd, &dest, pkt, CMD_NEXT,
+                                 "NEXT", &last_knob_send);
+                else if (ev.code == KNOB_CCW)
+                    send_command(sock_fd, &dest, pkt, CMD_PREV,
+                                 "PREV", &last_knob_send);
+            }
+        }
 
-        long long now = now_ms();
-        if (now - last_send < DEBOUNCE_MS) continue;
-        last_send = now;
-
-        build_packet(pkt, cmd);
-        if (sendto(sock_fd, pkt, PKT_SIZE, 0,
-                   (struct sockaddr *)&dest, sizeof(dest)) < 0) {
-            fprintf(stderr, "sendto: %s\n", strerror(errno));
-        } else {
-            printf("knob_reader: %s (%s)\n",
-                   cmd == CMD_NEXT ? "NEXT" : "PREV", cfg_radio_id);
-            fflush(stdout);
+        /* Button events (event3: gpio-keys) */
+        if (nfds > 1 && (fds[1].revents & POLLIN)) {
+            ssize_t n = read(btn_fd, &ev, sizeof(ev));
+            if (n < (ssize_t)sizeof(ev)) {
+                if (n < 0 && errno == EINTR) continue;
+                fprintf(stderr, "Button read error: %s\n", strerror(errno));
+                break;
+            }
+            if (ev.type == EV_KEY && ev.value == 1) {
+                if (ev.code == BTN_EMERGENCY)
+                    send_command(sock_fd, &dest, pkt, CMD_EMERGENCY,
+                                 "EMERGENCY", &last_btn_send);
+                else if (ev.code == BTN_IDENT)
+                    send_command(sock_fd, &dest, pkt, CMD_IDENT,
+                                 "IDENT", &last_btn_send);
+            }
         }
     }
 
     close(sock_fd);
-    close(input_fd);
+    close(knob_fd);
+    if (btn_fd >= 0) close(btn_fd);
     return 0;
 }

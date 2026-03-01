@@ -5,7 +5,10 @@ Mumla Channel Bot - Secure multi-radio channel switching for Mumble
 Receives HMAC-signed UDP from knob_reader binaries on multiple TE300K
 radios and moves each radio's Mumla user between channels.
 
-Announces via Mumble text message → Mumla TTS.
+Supports emergency alerts (E) and ident broadcasts (I).
+Announces via Mumble text message -> Mumla TTS.
+
+All configuration via environment variables (see docker-compose.yml).
 
 License: GPLv3
 """
@@ -19,12 +22,7 @@ import time
 import signal
 import logging
 import socket
-import threading
-
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
+import fnmatch
 
 try:
     import pymumble_py3 as pymumble
@@ -45,6 +43,8 @@ HMAC_LEN = 32
 # Replay window: reject packets older than this (seconds)
 REPLAY_WINDOW = 30
 
+VALID_COMMANDS = ('N', 'P', 'E', 'I')
+
 
 # ============================================================================
 # Packet verification
@@ -60,7 +60,6 @@ def verify_packet(data, secret):
     payload = data[:PAYLOAD_LEN]
     received_hmac = data[HMAC_OFFSET:HMAC_OFFSET + HMAC_LEN]
 
-    # Verify HMAC
     expected_hmac = hmac.new(
         secret.encode('utf-8'),
         payload,
@@ -71,19 +70,17 @@ def verify_packet(data, secret):
         log.warning("HMAC verification failed - invalid secret or tampered packet")
         return None, None
 
-    # Parse payload
     cmd = chr(data[0])
     radio_id = data[1:1 + RADIO_ID_LEN].rstrip(b'\x00').decode('ascii', errors='replace')
     timestamp = struct.unpack('>I', data[9:13])[0]
 
-    # Replay protection
     now = int(time.time())
     age = abs(now - timestamp)
     if age > REPLAY_WINDOW:
         log.warning("Replay rejected: packet age %ds (radio=%s)", age, radio_id)
         return None, None
 
-    if cmd not in ('N', 'P'):
+    if cmd not in VALID_COMMANDS:
         log.debug("Unknown command: %r", cmd)
         return None, None
 
@@ -97,8 +94,8 @@ class ChannelManager:
     def __init__(self, mumble_obj, radio_map, sort_by='id',
                  skip_root=True, wrap_around=True):
         """
-        radio_map: dict mapping radio_id -> mumla_username
-        e.g. {'radio01': 'TE300K-1', 'radio02': 'TE300K-2'}
+        radio_map: dict mapping radio_id -> mumla_username (supports fnmatch wildcards)
+        e.g. {'radio01': 'TE300K', 'radio02': 'P*'}
         """
         self.mumble = mumble_obj
         self.radio_map = radio_map
@@ -117,9 +114,15 @@ class ChannelManager:
         return channels
 
     def find_user_by_name(self, username):
+        """Find a user by name. Supports fnmatch wildcards (e.g. 'P*')."""
+        has_wildcard = '*' in username or '?' in username
         for session_id, user in self.mumble.users.items():
-            if user['name'] == username:
-                return user
+            if has_wildcard:
+                if fnmatch.fnmatch(user['name'], username):
+                    return user
+            else:
+                if user['name'] == username:
+                    return user
         return None
 
     def switch(self, radio_id, direction):
@@ -168,8 +171,8 @@ class ChannelManager:
         if target_id == current_id:
             return target_name, target_id
 
-        log.info("[%s] Moving '%s' → %s (ID %d)",
-                 radio_id, username, target_name, target_id)
+        log.info("[%s] Moving '%s' -> %s (ID %d)",
+                 radio_id, user['name'], target_name, target_id)
         try:
             cmd = MoveCmd(user['session'], target_id)
             self.mumble.execute_command(cmd)
@@ -192,25 +195,20 @@ class ChannelBot:
         self.last_switch = {}  # per-radio debounce
         self.debounce_ms = 200
 
-        # Parse radio map from config: [radios] section
-        self.radio_map = {}
-        self.secret = config.get('security', 'secret')
+        self.radio_map = config['radios']
+        self.secret = config['secret']
         self.allowed_ips = set()
 
-        if config.has_section('radios'):
-            for radio_id, mumla_user in config.items('radios'):
-                self.radio_map[radio_id] = mumla_user
-
-        if config.has_option('security', 'allowed_ips'):
-            ips = config.get('security', 'allowed_ips')
-            if ips.strip():
-                self.allowed_ips = set(ip.strip() for ip in ips.split(','))
+        if config['allowed_ips'].strip():
+            self.allowed_ips = set(
+                ip.strip() for ip in config['allowed_ips'].split(',')
+            )
 
     def connect_mumble(self):
-        host = self.config.get('mumble', 'host')
-        port = self.config.getint('mumble', 'port')
-        username = self.config.get('mumble', 'bot_username')
-        password = self.config.get('mumble', 'bot_password')
+        host = self.config['mumble_host']
+        port = self.config['mumble_port']
+        username = self.config['bot_username']
+        password = self.config['bot_password']
 
         log.info("Connecting to %s:%d as '%s'...", host, port, username)
         self.mumble = pymumble.Mumble(
@@ -223,13 +221,14 @@ class ChannelBot:
 
         self.channel_mgr = ChannelManager(
             self.mumble, self.radio_map,
-            sort_by=self.config.get('channels', 'sort_by'),
-            skip_root=self.config.getboolean('channels', 'skip_root'),
-            wrap_around=self.config.getboolean('channels', 'wrap_around'),
+            sort_by=self.config['channels_sort_by'],
+            skip_root=self.config['channels_skip_root'],
+            wrap_around=self.config['channels_wrap_around'],
         )
 
     def announce(self, radio_id, channel_name, channel_id):
-        if not self.config.getboolean('announce', 'mumble_message'):
+        """Send channel name to the radio user via text message (TTS)."""
+        if not self.config['announce_enabled']:
             return
         username = self.radio_map.get(radio_id)
         if not username:
@@ -237,12 +236,33 @@ class ChannelBot:
         user = self.channel_mgr.find_user_by_name(username)
         if not user:
             return
-        fmt = self.config.get('announce', 'format')
+        fmt = self.config['announce_format']
         msg = fmt.format(channel=channel_name, id=channel_id)
         try:
             self.mumble.users[user['session']].send_text_message(msg)
         except Exception as e:
             log.warning("Failed to send TTS message: %s", e)
+
+    def broadcast_to_channel(self, radio_id, message):
+        """Send a text message to the channel the radio user is in."""
+        if radio_id not in self.radio_map:
+            log.warning("broadcast: unknown radio_id '%s'", radio_id)
+            return
+
+        username = self.radio_map[radio_id]
+        user = self.channel_mgr.find_user_by_name(username)
+        if not user:
+            log.warning("broadcast: user '%s' (radio %s) not on server",
+                        username, radio_id)
+            return
+
+        channel_id = user['channel_id']
+        try:
+            self.mumble.channels[channel_id].send_text_message(message)
+            log.info("[%s] Broadcast to channel %d: %s",
+                     radio_id, channel_id, message)
+        except Exception as e:
+            log.error("broadcast failed: %s", e)
 
     def handle_packet(self, data, addr):
         # IP allowlist
@@ -261,10 +281,23 @@ class ChannelBot:
             return
         self.last_switch[radio_id] = now
 
-        direction = 'next' if cmd == 'N' else 'prev'
-        name, cid = self.channel_mgr.switch(radio_id, direction)
-        if name:
-            self.announce(radio_id, name, cid)
+        if cmd in ('N', 'P'):
+            direction = 'next' if cmd == 'N' else 'prev'
+            name, cid = self.channel_mgr.switch(radio_id, direction)
+            if name:
+                self.announce(radio_id, name, cid)
+        elif cmd == 'E':
+            msg = self.config['emergency_format']
+            log.warning("[%s] EMERGENCY triggered", radio_id)
+            self.broadcast_to_channel(radio_id, msg)
+        elif cmd == 'I':
+            fmt = self.config['ident_format']
+            username = self.radio_map.get(radio_id, radio_id)
+            # Resolve wildcard to actual connected username
+            user = self.channel_mgr.find_user_by_name(username)
+            actual_name = user['name'] if user else username
+            msg = fmt.format(username=actual_name)
+            self.broadcast_to_channel(radio_id, msg)
 
     def run(self):
         self.running = True
@@ -277,20 +310,25 @@ class ChannelBot:
         for ch in channels:
             log.info("  [%d] %s", ch['channel_id'], ch['name'])
 
-        log.info("Radio → User mapping:")
+        log.info("Radio -> User mapping:")
         for rid, uname in self.radio_map.items():
             user = self.channel_mgr.find_user_by_name(uname)
-            status = f"channel {user['channel_id']}" if user else "NOT CONNECTED"
-            log.info("  %s → %s (%s)", rid, uname, status)
+            if user:
+                status = f"channel {user['channel_id']}"
+                display = f"{uname} -> {user['name']}" if uname != user['name'] else uname
+            else:
+                status = "NOT CONNECTED"
+                display = uname
+            log.info("  %s -> %s (%s)", rid, display, status)
 
         if self.allowed_ips:
             log.info("Allowed source IPs: %s", ', '.join(self.allowed_ips))
         else:
-            log.info("Accepting from any IP (use allowed_ips to restrict)")
+            log.info("Accepting from any IP (use ALLOWED_IPS to restrict)")
 
         # UDP listener
-        listen_addr = self.config.get('udp', 'listen_addr')
-        listen_port = self.config.getint('udp', 'listen_port')
+        listen_addr = self.config['udp_addr']
+        listen_port = self.config['udp_port']
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((listen_addr, listen_port))
@@ -298,6 +336,7 @@ class ChannelBot:
 
         log.info("Listening on UDP %s:%d (HMAC-SHA256, replay window=%ds)",
                  listen_addr, listen_port, REPLAY_WINDOW)
+        log.info("Commands: N(ext) P(rev) E(mergency) I(dent)")
         log.info("Ready!")
 
         try:
@@ -320,52 +359,52 @@ class ChannelBot:
 
 
 # ============================================================================
-# Config
+# Config from environment variables
 # ============================================================================
-def load_config(path):
-    config = configparser.ConfigParser()
-    defaults = {
-        'mumble': {
-            'host': '127.0.0.1', 'port': '64738',
-            'bot_username': 'ChannelBot', 'bot_password': '',
-        },
-        'security': {
-            'secret': '',
-            'allowed_ips': '',
-        },
-        'udp': {
-            'listen_port': '4378', 'listen_addr': '0.0.0.0',
-        },
-        'channels': {
-            'sort_by': 'id', 'skip_root': 'true', 'wrap_around': 'true',
-        },
-        'announce': {
-            'mumble_message': 'true', 'format': '{channel}',
-        },
-        'logging': {
-            'level': 'INFO',
-        },
-    }
-    for section, values in defaults.items():
-        if not config.has_section(section):
-            config.add_section(section)
-        for k, v in values.items():
-            config.set(section, k, v)
+def load_env_config():
+    """Load all configuration from environment variables."""
 
-    if path and os.path.exists(path):
-        config.read(path)
+    def env_bool(key, default='true'):
+        return os.environ.get(key, default).lower() in ('true', '1', 'yes')
+
+    config = {
+        'mumble_host': os.environ.get('MUMBLE_HOST', '127.0.0.1'),
+        'mumble_port': int(os.environ.get('MUMBLE_PORT', '64738')),
+        'bot_username': os.environ.get('BOT_USERNAME', 'ChannelBot'),
+        'bot_password': os.environ.get('BOT_PASSWORD', ''),
+        'secret': os.environ.get('SECRET', ''),
+        'allowed_ips': os.environ.get('ALLOWED_IPS', ''),
+        'udp_port': int(os.environ.get('UDP_PORT', '4378')),
+        'udp_addr': os.environ.get('UDP_ADDR', '0.0.0.0'),
+        'channels_sort_by': os.environ.get('CHANNELS_SORT_BY', 'id'),
+        'channels_skip_root': env_bool('CHANNELS_SKIP_ROOT', 'true'),
+        'channels_wrap_around': env_bool('CHANNELS_WRAP_AROUND', 'true'),
+        'announce_enabled': env_bool('ANNOUNCE_ENABLED', 'true'),
+        'announce_format': os.environ.get('ANNOUNCE_FORMAT', '{channel}'),
+        'log_level': os.environ.get('LOG_LEVEL', 'INFO'),
+        'emergency_format': os.environ.get('EMERGENCY_FORMAT', 'alert alert'),
+        'ident_format': os.environ.get('IDENT_FORMAT', '{username}'),
+    }
+
+    # Parse RADIOS: "radio01=TE300K,radio02=P*"
+    # Supports fnmatch wildcards in usernames (e.g. P* matches any user starting with P)
+    config['radios'] = {}
+    radios_str = os.environ.get('RADIOS', '')
+    if radios_str.strip():
+        for pair in radios_str.split(','):
+            pair = pair.strip()
+            if '=' in pair:
+                radio_id, mumla_user = pair.split('=', 1)
+                config['radios'][radio_id.strip()] = mumla_user.strip()
+
     return config
 
 
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Mumla Channel Bot - Multi-radio')
-    p.add_argument('-c', '--config', default='bot_config.ini')
-    p.add_argument('--host', help='Mumble server host')
-    p.add_argument('--mumla-user', help='Single radio: Mumla username')
-    p.add_argument('--radio-id', default='radio01', help='Single radio: ID')
-    p.add_argument('--secret', help='Shared secret')
-    p.add_argument('--list', action='store_true', help='List channels/users')
+    p.add_argument('--list', action='store_true',
+                   help='List channels/users and exit')
     p.add_argument('--gen-secret', action='store_true',
                    help='Generate a random secret and exit')
     args = p.parse_args()
@@ -374,34 +413,25 @@ def main():
         import secrets
         s = secrets.token_urlsafe(32)
         print(f"Generated secret: {s}")
-        print("Put this in bot_config.ini [security] secret=")
+        print("Set this as SECRET env var in docker-compose.yml")
         print("and in each radio's knob.conf secret=")
         return
 
-    config = load_config(args.config)
+    config = load_env_config()
 
-    # CLI overrides
-    if args.host:
-        config.set('mumble', 'host', args.host)
-    if args.secret:
-        config.set('security', 'secret', args.secret)
-    if args.mumla_user:
-        if not config.has_section('radios'):
-            config.add_section('radios')
-        config.set('radios', args.radio_id, args.mumla_user)
+    level = getattr(logging, config['log_level'].upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s'
+    )
 
-    level = getattr(logging, config.get('logging', 'level').upper(), logging.INFO)
-    logging.basicConfig(level=level, format='%(asctime)s [%(levelname)s] %(message)s')
-
-    # Validate
-    if not config.get('security', 'secret'):
-        log.error("No secret configured! Run with --gen-secret to create one, "
-                   "then set it in bot_config.ini [security] secret=")
+    if not config['secret']:
+        log.error("No SECRET env var set! Run with --gen-secret to create one.")
         sys.exit(1)
 
-    if not config.has_section('radios') or not config.options('radios'):
-        log.error("No radios configured! Add [radios] section to config, "
-                   "e.g. radio01 = TE300K")
+    if not config['radios']:
+        log.error("No RADIOS env var set! "
+                  "Format: RADIOS=radio01=TE300K,radio02=P*")
         sys.exit(1)
 
     if args.list:
@@ -413,7 +443,8 @@ def main():
             print(f"  [{ch_id}] {ch['name']}")
         print("\nUsers:")
         for sess, user in bot.mumble.users.items():
-            print(f"  {user['name']} (session {sess}, channel {user['channel_id']})")
+            print(f"  {user['name']} (session {sess}, "
+                  f"channel {user['channel_id']})")
         bot.mumble.stop()
         return
 

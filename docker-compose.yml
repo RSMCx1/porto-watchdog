@@ -1,17 +1,3 @@
-# =============================================================================
-# Mumla Channel Switcher - Docker Compose
-# =============================================================================
-#
-# OPTION A - Add to your EXISTING Mumble stack:
-#   Copy just the 'channel-bot' service block into your existing
-#   docker-compose.yml. Make sure the Mumble server hostname in
-#   bot_config.ini matches your murmur service name.
-#
-# OPTION B - Use this whole file as a standalone stack:
-#   Includes a murmur service as example. Adjust to match your setup.
-#
-# =============================================================================
-
 services:
   # -------------------------------------------------------------------------
   # Your existing Mumble server (example - adjust to match YOUR config)
@@ -29,23 +15,57 @@ services:
 
   # -------------------------------------------------------------------------
   # >>> ADD THIS TO YOUR EXISTING STACK <<<
+  # All config via environment variables - no config files needed
   # -------------------------------------------------------------------------
   channel-bot:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    # Or use the pre-built image:
+    # image: rsmcx1/porto-watchdog:latest
     container_name: channel-bot
     ports:
-      # UDP port for knob_reader packets from your TE300K radios
       - "4378:4378/udp"
-    volumes:
-      # Mount config externally so you can edit without rebuilding
-      - ./bot_config.ini:/app/bot_config.ini:ro
+    environment:
+      # -- Mumble server --
+      MUMBLE_HOST: murmur
+      MUMBLE_PORT: "64738"
+      BOT_USERNAME: ChannelBot
+      BOT_PASSWORD: ""
+
+      # -- Security --
+      # Generate with: docker run --rm rsmcx1/porto-watchdog --gen-secret
+      SECRET: "CHANGE_ME_GENERATE_A_REAL_SECRET"
+      # Optional: restrict source IPs (comma-separated, empty = any)
+      ALLOWED_IPS: ""
+
+      # -- UDP listener --
+      UDP_PORT: "4378"
+      UDP_ADDR: "0.0.0.0"
+
+      # -- Channel navigation --
+      CHANNELS_SORT_BY: id
+      CHANNELS_SKIP_ROOT: "true"
+      CHANNELS_WRAP_AROUND: "true"
+
+      # -- TTS announcements --
+      ANNOUNCE_ENABLED: "true"
+      ANNOUNCE_FORMAT: "{channel}"
+
+      # -- Emergency & Ident --
+      EMERGENCY_FORMAT: "alert alert"
+      IDENT_FORMAT: "{username}"
+
+      # -- Logging --
+      LOG_LEVEL: INFO
+
+      # -- Radio mapping --
+      # Format: radio_id=mumla_username (comma-separated, wildcards supported)
+      # Examples: "radio01=TE300K" or "radio01=P*" (matches any user starting with P)
+      RADIOS: "radio01=TE300K"
     depends_on:
       - murmur
     restart: unless-stopped
-    # Small delay so murmur is ready before the bot connects
-    entrypoint: ["sh", "-c", "sleep 5 && python3 channel_bot.py -c /app/bot_config.ini"]
 
 volumes:
   murmur-data:

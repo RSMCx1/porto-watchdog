@@ -231,16 +231,38 @@ class ChannelBot:
                 ip.strip() for ip in config['allowed_ips'].split(',')
             )
 
+    def ensure_certificate(self):
+        """Generate a persistent certificate so the bot can be registered."""
+        cert_dir = self.config['cert_dir']
+        certfile = os.path.join(cert_dir, 'bot.pem')
+        keyfile = os.path.join(cert_dir, 'bot.key')
+        if os.path.exists(certfile) and os.path.exists(keyfile):
+            log.info("Using existing certificate: %s", certfile)
+            return certfile, keyfile
+        os.makedirs(cert_dir, exist_ok=True)
+        log.info("Generating bot certificate in %s ...", cert_dir)
+        import subprocess
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+            '-keyout', keyfile, '-out', certfile,
+            '-days', '3650', '-nodes',
+            '-subj', '/CN=' + self.config['bot_username'],
+        ], check=True, capture_output=True)
+        log.info("Certificate generated (valid 10 years)")
+        return certfile, keyfile
+
     def connect_mumble(self):
         _load_pymumble()
         host = self.config['mumble_host']
         port = self.config['mumble_port']
         username = self.config['bot_username']
         password = self.config['bot_password']
+        certfile, keyfile = self.ensure_certificate()
 
         log.info("Connecting to %s:%d as '%s'...", host, port, username)
         self.mumble = pymumble.Mumble(
-            host, username, port=port, password=password, reconnect=True
+            host, username, port=port, password=password, reconnect=True,
+            certfile=certfile, keyfile=keyfile,
         )
         self.mumble.set_receive_sound(False)
         self.mumble.start()
@@ -413,6 +435,7 @@ def load_env_config():
         'log_level': os.environ.get('LOG_LEVEL', 'INFO'),
         'emergency_format': os.environ.get('EMERGENCY_FORMAT', 'alert alert'),
         'ident_format': os.environ.get('IDENT_FORMAT', '{username}'),
+        'cert_dir': os.environ.get('CERT_DIR', '/app/certs'),
     }
 
     # Parse RADIOS: "radio01=TE300K,radio02=P*"

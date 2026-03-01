@@ -49,4 +49,11 @@ services:
       # Format: radio_id=mumla_username (comma-separated, wildcards supported)
       # Examples: "radio01=TE300K" or "radio01=P*" (matches any user starting with P)
       RADIOS: "radio01=TE300K"
+    volumes:
+      # Persist bot certificate so it keeps the same identity across restarts
+      # (required for Mumble ACL/registration)
+      - porto-certs:/app/certs
     restart: unless-stopped
+
+volumes:
+  porto-certs:

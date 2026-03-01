@@ -106,10 +106,15 @@ environment:
 
 All other variables have sensible defaults (see full list below).
 
-**1c. Grant bot permissions**
+**1c. Register the bot and grant permissions**
 
-In your Mumble server ACL (root channel), grant **Move** permission
-to the bot user (`ChannelBot`).
+The bot auto-generates a persistent certificate on first start (stored
+in the `porto-certs` Docker volume). After the bot connects for the
+first time:
+
+1. Open a Mumble client, connect to the same server as an admin
+2. Right-click the bot user (`ChannelBot`) and select **Register**
+3. Go to the root channel ACL, add `ChannelBot`, and grant **Move** permission
 
 **1d. Open firewall**
 

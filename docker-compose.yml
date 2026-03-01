@@ -33,6 +33,8 @@ services:
       CHANNELS_SORT_BY: id
       CHANNELS_SKIP_ROOT: "true"
       CHANNELS_WRAP_AROUND: "true"
+      # Skip specific channels (comma-separated names, case-sensitive)
+      # CHANNELS_SKIP: "Lobby,AFK,Admin"
 
       # -- TTS announcements --
       ANNOUNCE_ENABLED: "true"

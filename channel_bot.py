@@ -120,21 +120,26 @@ def verify_packet(data, config):
 # ============================================================================
 class ChannelManager:
     def __init__(self, mumble_obj, radio_map, sort_by='id',
-                 skip_root=True, wrap_around=True):
+                 skip_root=True, wrap_around=True, skip_channels=None):
         """
         radio_map: dict mapping radio_id -> mumla_username (supports fnmatch wildcards)
         e.g. {'radio01': 'TE300K', 'radio02': 'P*'}
+        skip_channels: set of channel names to exclude from rotation
         """
         self.mumble = mumble_obj
         self.radio_map = radio_map
         self.sort_by = sort_by
         self.skip_root = skip_root
         self.wrap_around = wrap_around
+        self.skip_channels = skip_channels or set()
 
     def get_sorted_channels(self):
         channels = list(self.mumble.channels.values())
         if self.skip_root:
             channels = [c for c in channels if c['channel_id'] != 0]
+        if self.skip_channels:
+            channels = [c for c in channels
+                        if c['name'] not in self.skip_channels]
         if self.sort_by == 'name':
             channels.sort(key=lambda c: c['name'].lower())
         else:
@@ -274,6 +279,7 @@ class ChannelBot:
             sort_by=self.config['channels_sort_by'],
             skip_root=self.config['channels_skip_root'],
             wrap_around=self.config['channels_wrap_around'],
+            skip_channels=self.config['channels_skip'],
         )
 
     def announce(self, radio_id, channel_name, channel_id):
@@ -356,6 +362,9 @@ class ChannelBot:
 
         # Log setup
         channels = self.channel_mgr.get_sorted_channels()
+        if self.config['channels_skip']:
+            log.info("Skipping channels: %s",
+                     ', '.join(sorted(self.config['channels_skip'])))
         log.info("Channels (%d):", len(channels))
         for ch in channels:
             log.info("  [%d] %s", ch['channel_id'], ch['name'])
@@ -437,6 +446,14 @@ def load_env_config():
         'ident_format': os.environ.get('IDENT_FORMAT', '{username}'),
         'cert_dir': os.environ.get('CERT_DIR', '/app/certs'),
     }
+
+    # Parse CHANNELS_SKIP: "Lobby,AFK,Admin" (comma-separated channel names to exclude)
+    config['channels_skip'] = set()
+    skip_str = os.environ.get('CHANNELS_SKIP', '')
+    if skip_str.strip():
+        config['channels_skip'] = set(
+            name.strip() for name in skip_str.split(',') if name.strip()
+        )
 
     # Parse RADIOS: "radio01=TE300K,radio02=P*"
     config['radios'] = {}

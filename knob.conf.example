@@ -1,8 +1,7 @@
-# knob_reader config for TE300K
+# porto-watchdog config for TE300K
 # Push to: /data/local/tmp/knob.conf
-# Run: /data/local/tmp/knob_reader -f /data/local/tmp/knob.conf
 
-# IP of the machine running channel_bot.py (your Docker host)
+# IP or hostname of the machine running the remote watchdog (DNS supported)
 host=192.168.1.100
 
 # UDP port (must match UDP_PORT in docker-compose.yml)
@@ -11,8 +10,8 @@ port=4378
 # Unique ID for this radio (max 8 chars, must match RADIOS env var)
 radio_id=radio01
 
-# Shared secret (must match SECRET env var in docker-compose.yml)
-# Generate with: python3 channel_bot.py --gen-secret
+# Secret (must match SECRET or this radio's entry in SECRETS)
+# Generate with: docker run --rm rsmcx1/porto-watchdog --gen-secret
 secret=CHANGE_ME_GENERATE_A_REAL_SECRET
 
 # Input device - rotary knob (TE300K channel switch)

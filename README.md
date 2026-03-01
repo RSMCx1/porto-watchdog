@@ -145,7 +145,7 @@ adb install mumla.apk
 Copy `knob.conf.example` to `knob.conf` and fill in your values:
 
 ```ini
-host=192.168.1.100         # IP of your server running the remote watchdog
+host=192.168.1.100         # IP or hostname of your server (DNS supported)
 port=4378                  # must match UDP_PORT on the server
 radio_id=radio01           # unique per radio (max 8 chars)
 secret=your-secret-here    # same secret as Step 1a
@@ -243,6 +243,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `CHANNELS_SORT_BY` | id | Channel order: `id` or `name` |
 | `CHANNELS_SKIP_ROOT` | true | Skip root channel |
 | `CHANNELS_WRAP_AROUND` | true | Wrap at channel boundaries |
+| `CHANNELS_SKIP` | *(empty)* | Channel names to skip (comma-separated) |
 | `ANNOUNCE_ENABLED` | true | TTS channel name on switch |
 | `ANNOUNCE_FORMAT` | {channel} | Channel announce template |
 | `EMERGENCY_FORMAT` | alert alert | Emergency broadcast message |
@@ -278,6 +279,7 @@ must be re-keyed.
 | `channel_bot.py` | Docker | Remote watchdog server |
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
+| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge |
 
 Binaries are built automatically by CI — download `porto-watchdog` from
 the [Actions](../../actions) tab (artifact: `porto-watchdog-arm`).
@@ -309,6 +311,12 @@ Use `P*` wildcards if the name varies.
 
 **Bot can't move users** —
 Grant Move permission in Mumble ACL for the bot user.
+
+**Auto-start not working after reboot** —
+Check logcat: `adb shell 'logcat -d | grep -i pttbridge'`
+If you see "Service Intent must be explicit", the APK needs to be updated.
+Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog`
+and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
 
 **No TTS** —
 Enable Text-to-Speech in Mumla settings on the radio.

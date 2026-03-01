@@ -31,7 +31,7 @@ Two watchdogs work together:
   │  PTT (F1)   Ident (F2)   Emergency (F3)        │
   │  Knob CW (F14)     Knob CCW (F13)              │
   │       │         │         │                    │
-  │  ┌────┴─────────┴─────────┴────────────────┐   │
+  │  ┌────┴─────────┴─────────┴─────────────────┐  │
   │  │    porto-watchdog (local watchdog)       │  │
   │  │    background daemon on the radio        │  │
   │  │                                          │  │

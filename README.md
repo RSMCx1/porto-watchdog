@@ -152,7 +152,16 @@ Each radio needs a **unique `radio_id`**. The `secret` must match what
 the server has — either the shared `SECRET` or that radio's entry in
 `SECRETS`.
 
-**2d. Push files to the radio**
+**2d. Download the porto-watchdog binary**
+
+Go to the [Actions tab](../../actions) on GitHub, click the latest
+successful **Build and Push** run, scroll to **Artifacts**, and download
+**porto-watchdog-arm**. Unzip it — the file inside is `porto-watchdog`.
+
+Alternatively, if there is a tagged release, grab it from the
+[Releases page](../../releases).
+
+**2e. Push files to the radio**
 
 ```bash
 adb push porto-watchdog /data/local/tmp/porto-watchdog
@@ -163,7 +172,7 @@ adb push knob.conf /data/local/tmp/knob.conf
 adb shell ln -sf /data/local/tmp/porto-watchdog /data/local/tmp/ptt_bridge
 ```
 
-**2e. Start the service**
+**2f. Start the service**
 
 ```bash
 adb shell am startservice -a com.pttbridge.START
@@ -171,7 +180,7 @@ adb shell am startservice -a com.pttbridge.START
 
 Only needed once. After this, everything auto-starts on every boot.
 
-**2f. Configure Mumla**
+**2g. Configure Mumla**
 
 Open Mumla on the radio, add your Mumble server, and enable
 **Text-to-Speech** in settings so channel names and alerts are

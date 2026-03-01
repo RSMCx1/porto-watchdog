@@ -41,6 +41,7 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <linux/input.h>
 
 /* ---- Minimal SHA-256 + HMAC-SHA256 (no OpenSSL needed) ---- */
@@ -336,10 +337,48 @@ int main(int argc, char *argv[]) {
                 cfg_device, strerror(errno));
     }
 
+    /* Set up UDP socket if config is valid (retry until network is ready) */
+    /* Do this BEFORE PTT connect so network wait doesn't eat PTT retries */
+    if (udp_enabled) {
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd < 0) {
+            perror("UDP socket");
+            udp_enabled = 0;
+        } else {
+            int resolved = 0;
+            int retries;
+            for (retries = 0; retries < 60; retries++) {
+                struct addrinfo hints, *res;
+                char port_str[16];
+                memset(&hints, 0, sizeof(hints));
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_DGRAM;
+                snprintf(port_str, sizeof(port_str), "%d", cfg_port);
+                int rc = getaddrinfo(cfg_host, port_str, &hints, &res);
+                if (rc == 0 && res) {
+                    memcpy(&dest, res->ai_addr, res->ai_addrlen);
+                    freeaddrinfo(res);
+                    resolved = 1;
+                    break;
+                }
+                if (res) freeaddrinfo(res);
+                if (retries == 0)
+                    fprintf(stderr, "porto-watchdog: waiting for network (resolving %s)...\n", cfg_host);
+                sleep(2);
+            }
+            if (!resolved) {
+                fprintf(stderr, "porto-watchdog: failed to resolve %s after %d attempts\n",
+                        cfg_host, retries);
+                close(udp_fd);
+                udp_enabled = 0;
+            }
+        }
+    }
+
     /* Connect PTT socket (retry on failure, service may not be up yet) */
     {
         int retries;
-        for (retries = 0; retries < 30; retries++) {
+        for (retries = 0; retries < 60; retries++) {
             ptt_fd = ptt_connect();
             if (ptt_fd >= 0) {
                 ptt_connected = 1;
@@ -350,25 +389,7 @@ int main(int argc, char *argv[]) {
             usleep(500000); /* 500ms */
         }
         if (!ptt_connected) {
-            fprintf(stderr, "Warning: PTT socket not available (PTT disabled)\n");
-        }
-    }
-
-    /* Set up UDP socket if config is valid */
-    if (udp_enabled) {
-        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_fd < 0) {
-            perror("UDP socket");
-            udp_enabled = 0;
-        } else {
-            memset(&dest, 0, sizeof(dest));
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(cfg_port);
-            if (inet_aton(cfg_host, &dest.sin_addr) == 0) {
-                fprintf(stderr, "Invalid address: %s\n", cfg_host);
-                close(udp_fd);
-                udp_enabled = 0;
-            }
+            fprintf(stderr, "porto-watchdog: PTT socket not available yet (will retry on keypress)\n");
         }
     }
 
@@ -419,16 +440,24 @@ int main(int argc, char *argv[]) {
             if (ev.type == EV_KEY) {
                 /* PTT: send both press (1) and release (0) */
                 if (ev.code == KEY_PTT && (ev.value == 1 || ev.value == 0)) {
+                    /* Try to reconnect if not connected */
+                    if (!ptt_connected) {
+                        ptt_fd = ptt_connect();
+                        if (ptt_fd >= 0) {
+                            ptt_connected = 1;
+                            fprintf(stderr, "porto-watchdog: PTT socket reconnected\n");
+                        }
+                    }
                     if (ptt_connected) {
                         if (ptt_send(ptt_fd, ev.value) < 0) {
-                            /* Socket died, try reconnecting */
+                            /* Socket died, try reconnecting once */
                             close(ptt_fd);
                             ptt_fd = ptt_connect();
                             if (ptt_fd >= 0) {
                                 ptt_send(ptt_fd, ev.value);
                             } else {
                                 ptt_connected = 0;
-                                fprintf(stderr, "porto-watchdog: PTT socket lost\n");
+                                fprintf(stderr, "porto-watchdog: PTT socket lost, will retry on next press\n");
                             }
                         }
                         printf("porto-watchdog: PTT %s\n",

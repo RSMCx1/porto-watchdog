@@ -191,7 +191,14 @@ static char cfg_secret[256] = "";
 static char cfg_device[256] = "/dev/input/event4";
 static char cfg_button_device[256] = "/dev/input/event3";
 
-static int udp_enabled = 0;  /* set to 1 if config loaded successfully */
+static int want_udp = 0;     /* config says we should use UDP */
+static int udp_enabled = 0;  /* DNS resolved, UDP is working */
+
+/* UDP state (global for lazy DNS retry) */
+static int udp_fd = -1;
+static struct sockaddr_in udp_dest;
+static long long last_dns_attempt = 0;
+#define DNS_RETRY_MS 5000
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -249,6 +256,40 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
                 pkt, PAYLOAD_LEN, pkt + HMAC_OFFSET);
 }
 
+/* Try to resolve DNS and enable UDP. Rate-limited to once per DNS_RETRY_MS.
+ * Returns 1 on success, 0 on failure. Safe to call repeatedly. */
+static int try_resolve_udp(void) {
+    struct addrinfo hints, *res;
+    char port_str[16];
+    long long now = now_ms();
+
+    if (now - last_dns_attempt < DNS_RETRY_MS) return 0;
+    last_dns_attempt = now;
+
+    if (udp_fd < 0) {
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd < 0) return 0;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    snprintf(port_str, sizeof(port_str), "%d", cfg_port);
+
+    int rc = getaddrinfo(cfg_host, port_str, &hints, &res);
+    if (rc == 0 && res) {
+        memcpy(&udp_dest, res->ai_addr, res->ai_addrlen);
+        freeaddrinfo(res);
+        udp_enabled = 1;
+        printf("porto-watchdog: resolved %s:%d - UDP enabled\n",
+               cfg_host, cfg_port);
+        fflush(stdout);
+        return 1;
+    }
+    if (res) freeaddrinfo(res);
+    return 0;
+}
+
 static int send_udp_command(int sock_fd, struct sockaddr_in *dest,
                             unsigned char pkt[PKT_SIZE], char cmd,
                             const char *label, long long *last_send) {
@@ -288,8 +329,7 @@ static int load_config(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    int btn_fd, knob_fd = -1, udp_fd = -1;
-    struct sockaddr_in dest;
+    int btn_fd, knob_fd = -1;
     struct input_event ev;
     long long last_knob_send = 0;
     long long last_btn_send = 0;
@@ -322,16 +362,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Check if UDP is viable */
+    /* Check if UDP should be enabled */
     if (config_loaded && cfg_host[0] && cfg_radio_id[0] && cfg_secret[0]) {
-        udp_enabled = 1;
+        want_udp = 1;
     }
 
     /*
      * Boot-resilient startup sequence:
      *   1. Wait for input devices (kernel may not have initialized them yet)
-     *   2. Connect PTT socket (local, wait for APK service)
-     *   3. Resolve DNS / set up UDP (wait for network — slowest)
+     *   2. Check PTT socket (local)
+     *   3. Try DNS once (non-blocking — retries lazily on each keypress)
      */
 
     /* 1. Open button/PTT device (event3) - retry at boot */
@@ -377,55 +417,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 3. Set up UDP socket and resolve remote watchdog (retry until network is ready) */
-    if (udp_enabled) {
-        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_fd < 0) {
-            perror("UDP socket");
-            udp_enabled = 0;
-        } else {
-            int resolved = 0;
-            int retries;
-            for (retries = 0; retries < 60; retries++) {
-                struct addrinfo hints, *res;
-                char port_str[16];
-                memset(&hints, 0, sizeof(hints));
-                hints.ai_family = AF_INET;
-                hints.ai_socktype = SOCK_DGRAM;
-                snprintf(port_str, sizeof(port_str), "%d", cfg_port);
-                int rc = getaddrinfo(cfg_host, port_str, &hints, &res);
-                if (rc == 0 && res) {
-                    memcpy(&dest, res->ai_addr, res->ai_addrlen);
-                    freeaddrinfo(res);
-                    resolved = 1;
-                    break;
-                }
-                if (res) freeaddrinfo(res);
-                if (retries == 0)
-                    fprintf(stderr, "porto-watchdog: waiting for network (resolving %s)...\n", cfg_host);
-                sleep(2);
-            }
-            if (!resolved) {
-                fprintf(stderr, "porto-watchdog: failed to resolve %s after %d attempts\n",
-                        cfg_host, retries);
-                close(udp_fd);
-                udp_enabled = 0;
-            }
+    /* 3. Try DNS once — if it fails, we'll retry on each keypress (no blocking) */
+    if (want_udp) {
+        if (!try_resolve_udp()) {
+            printf("porto-watchdog: DNS not ready yet, will retry on keypress\n");
+            fflush(stdout);
         }
     }
 
     /* Startup banner */
     printf("porto-watchdog: TE300K all-in-one handler\n");
-    printf("porto-watchdog: buttons=%s (PTT%s%s)\n",
+    printf("porto-watchdog: buttons=%s (PTT%s)\n",
            cfg_button_device,
-           udp_enabled ? " emergency ident" : "",
-           udp_enabled ? " [OK]" : "");
+           want_udp ? " emergency ident" : "");
     if (knob_fd >= 0)
         printf("porto-watchdog: knob=%s (channel switch%s)\n",
-               cfg_device, udp_enabled ? " [OK]" : " [N/A]");
-    if (udp_enabled)
-        printf("porto-watchdog: UDP target=%s:%d radio=%s\n",
-               cfg_host, cfg_port, cfg_radio_id);
+               cfg_device, want_udp ? "" : " [N/A]");
+    if (want_udp)
+        printf("porto-watchdog: UDP target=%s:%d radio=%s [%s]\n",
+               cfg_host, cfg_port, cfg_radio_id,
+               udp_enabled ? "OK" : "waiting for DNS");
     fflush(stdout);
 
     /* Set up poll: always have btn_fd, optionally knob_fd */
@@ -471,14 +482,17 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, "porto-watchdog: PTT socket unavailable\n");
                     }
                 }
-                /* Emergency & Ident: only on press (value 1), only if UDP enabled */
-                else if (ev.value == 1 && udp_enabled) {
-                    if (ev.code == BTN_EMERGENCY)
-                        send_udp_command(udp_fd, &dest, pkt, CMD_EMERGENCY,
-                                         "EMERGENCY", &last_btn_send);
-                    else if (ev.code == BTN_IDENT)
-                        send_udp_command(udp_fd, &dest, pkt, CMD_IDENT,
-                                         "IDENT", &last_btn_send);
+                /* Emergency & Ident: only on press (value 1) */
+                else if (ev.value == 1 && (ev.code == BTN_EMERGENCY || ev.code == BTN_IDENT)) {
+                    if (want_udp && !udp_enabled) try_resolve_udp();
+                    if (udp_enabled) {
+                        if (ev.code == BTN_EMERGENCY)
+                            send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
+                                             "EMERGENCY", &last_btn_send);
+                        else if (ev.code == BTN_IDENT)
+                            send_udp_command(udp_fd, &udp_dest, pkt, CMD_IDENT,
+                                             "IDENT", &last_btn_send);
+                    }
                 }
             }
         }
@@ -491,13 +505,17 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Knob read error: %s\n", strerror(errno));
                 break;
             }
-            if (ev.type == EV_KEY && ev.value == 1 && udp_enabled) {
-                if (ev.code == KNOB_CW)
-                    send_udp_command(udp_fd, &dest, pkt, CMD_NEXT,
-                                     "NEXT", &last_knob_send);
-                else if (ev.code == KNOB_CCW)
-                    send_udp_command(udp_fd, &dest, pkt, CMD_PREV,
-                                     "PREV", &last_knob_send);
+            if (ev.type == EV_KEY && ev.value == 1
+                    && (ev.code == KNOB_CW || ev.code == KNOB_CCW)) {
+                if (want_udp && !udp_enabled) try_resolve_udp();
+                if (udp_enabled) {
+                    if (ev.code == KNOB_CW)
+                        send_udp_command(udp_fd, &udp_dest, pkt, CMD_NEXT,
+                                         "NEXT", &last_knob_send);
+                    else if (ev.code == KNOB_CCW)
+                        send_udp_command(udp_fd, &udp_dest, pkt, CMD_PREV,
+                                         "PREV", &last_knob_send);
+                }
             }
         }
     }

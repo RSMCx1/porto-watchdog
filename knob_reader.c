@@ -41,7 +41,7 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
+/* netdb.h (getaddrinfo) intentionally not included — hangs on Android static */
 #include <signal.h>
 #include <linux/input.h>
 
@@ -257,53 +257,35 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
 }
 
 /* Resolve hostname to IPv4 address.
- * getaddrinfo doesn't work in static binaries on Android (glibc can't
- * talk to Android's netd DNS resolver). Fall back to ping, which uses
- * Android's native resolver and always works.
+ * This binary runs on Android where getaddrinfo() in static binaries
+ * hangs forever (glibc can't talk to Android's netd). Use ping instead,
+ * which goes through Android's native resolver and always works.
  * Returns 0 on success, -1 on failure. */
 static int resolve_hostname(const char *hostname, struct in_addr *out) {
+    char cmd[512], line[256];
+
     /* Fast path: already an IP address? */
     if (inet_aton(hostname, out))
         return 0;
 
-    /* Try getaddrinfo first (works on normal Linux, not on Android static) */
-    {
-        struct addrinfo hints, *res;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        int rc = getaddrinfo(hostname, NULL, &hints, &res);
-        if (rc == 0 && res) {
-            struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
-            *out = sa->sin_addr;
-            freeaddrinfo(res);
-            return 0;
-        }
-        if (res) freeaddrinfo(res);
-    }
+    /* Use ping to resolve via Android's system DNS resolver.
+     * Output line 1: "PING hostname (1.2.3.4) 56(84) bytes of data." */
+    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", hostname);
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
 
-    /* Android fallback: use ping to resolve via the system DNS resolver.
-     * Output: "PING hostname (1.2.3.4) 56(84) bytes of data." */
-    {
-        char cmd[512], line[256];
-        snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", hostname);
-        FILE *f = popen(cmd, "r");
-        if (f) {
-            if (fgets(line, sizeof(line), f)) {
-                char *open_paren = strchr(line, '(');
-                char *close_paren = open_paren ? strchr(open_paren, ')') : NULL;
-                if (open_paren && close_paren) {
-                    *close_paren = '\0';
-                    if (inet_aton(open_paren + 1, out)) {
-                        pclose(f);
-                        return 0;
-                    }
-                }
-            }
-            pclose(f);
+    int ok = -1;
+    if (fgets(line, sizeof(line), f)) {
+        char *open_paren = strchr(line, '(');
+        char *close_paren = open_paren ? strchr(open_paren, ')') : NULL;
+        if (open_paren && close_paren) {
+            *close_paren = '\0';
+            if (inet_aton(open_paren + 1, out))
+                ok = 0;
         }
     }
-
-    return -1;
+    pclose(f);
+    return ok;
 }
 
 /* Try to resolve DNS and enable UDP. Rate-limited to once per DNS_RETRY_MS.

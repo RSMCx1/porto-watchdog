@@ -256,11 +256,60 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
                 pkt, PAYLOAD_LEN, pkt + HMAC_OFFSET);
 }
 
+/* Resolve hostname to IPv4 address.
+ * getaddrinfo doesn't work in static binaries on Android (glibc can't
+ * talk to Android's netd DNS resolver). Fall back to ping, which uses
+ * Android's native resolver and always works.
+ * Returns 0 on success, -1 on failure. */
+static int resolve_hostname(const char *hostname, struct in_addr *out) {
+    /* Fast path: already an IP address? */
+    if (inet_aton(hostname, out))
+        return 0;
+
+    /* Try getaddrinfo first (works on normal Linux, not on Android static) */
+    {
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        int rc = getaddrinfo(hostname, NULL, &hints, &res);
+        if (rc == 0 && res) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+            *out = sa->sin_addr;
+            freeaddrinfo(res);
+            return 0;
+        }
+        if (res) freeaddrinfo(res);
+    }
+
+    /* Android fallback: use ping to resolve via the system DNS resolver.
+     * Output: "PING hostname (1.2.3.4) 56(84) bytes of data." */
+    {
+        char cmd[512], line[256];
+        snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", hostname);
+        FILE *f = popen(cmd, "r");
+        if (f) {
+            if (fgets(line, sizeof(line), f)) {
+                char *open_paren = strchr(line, '(');
+                char *close_paren = open_paren ? strchr(open_paren, ')') : NULL;
+                if (open_paren && close_paren) {
+                    *close_paren = '\0';
+                    if (inet_aton(open_paren + 1, out)) {
+                        pclose(f);
+                        return 0;
+                    }
+                }
+            }
+            pclose(f);
+        }
+    }
+
+    return -1;
+}
+
 /* Try to resolve DNS and enable UDP. Rate-limited to once per DNS_RETRY_MS.
  * Returns 1 on success, 0 on failure. Safe to call repeatedly. */
 static int try_resolve_udp(void) {
-    struct addrinfo hints, *res;
-    char port_str[16];
+    struct in_addr addr;
     long long now = now_ms();
 
     if (now - last_dns_attempt < DNS_RETRY_MS) return 0;
@@ -271,22 +320,17 @@ static int try_resolve_udp(void) {
         if (udp_fd < 0) return 0;
     }
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    snprintf(port_str, sizeof(port_str), "%d", cfg_port);
-
-    int rc = getaddrinfo(cfg_host, port_str, &hints, &res);
-    if (rc == 0 && res) {
-        memcpy(&udp_dest, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
+    if (resolve_hostname(cfg_host, &addr) == 0) {
+        memset(&udp_dest, 0, sizeof(udp_dest));
+        udp_dest.sin_family = AF_INET;
+        udp_dest.sin_port = htons(cfg_port);
+        udp_dest.sin_addr = addr;
         udp_enabled = 1;
-        printf("porto-watchdog: resolved %s:%d - UDP enabled\n",
-               cfg_host, cfg_port);
+        printf("porto-watchdog: resolved %s -> %s:%d - UDP enabled\n",
+               cfg_host, inet_ntoa(addr), cfg_port);
         fflush(stdout);
         return 1;
     }
-    if (res) freeaddrinfo(res);
     return 0;
 }
 

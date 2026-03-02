@@ -1,7 +1,12 @@
 # Porto Watchdog
 
-Hardware control system for TE300K Mumble radios. Onboard a radio once,
-everything auto-starts on boot and runs forever.
+After years of using cheap Baofeng radios with poor audio quality and limited range, it was time to step up to PTT over Cellular (PoC). Unfortunately, most PoC radios ship with locked-down firmware restricted to a handful of closed-source apps that require monthly license fees. Finding something worth buying when you only use it a few times a year — and want to keep communications private — is a real challenge.
+
+You can't have it all, so some concessions had to be made. The non-negotiable requirement: the radio must run Android, so third-party VoIP apps can be installed. This makes it possible to self-host voice services and encrypt communications end-to-end, keeping things private for family and friends. A bonus would be enough disk space, memory, and CPU headroom to run something like a stripped-down ATAK instance as a GPS tracker feeding into CivTAK.
+
+The TE300K checked those boxes. Porto Watchdog is the software that ties it all together — turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
+
+## How It Works
 
 Two watchdogs work together:
 
@@ -12,7 +17,7 @@ Two watchdogs work together:
   server, receives key events from all radios, switches channels, and
   broadcasts emergency/ident messages through the Mumble server.
 
-## What the Buttons Do
+### Button Mapping
 
 | Input | Key | What happens |
 |-------|-----|--------------|
@@ -22,7 +27,7 @@ Two watchdogs work together:
 | **Side button** | F2 | Ident — forwarded to remote watchdog, announces your name |
 | **Emergency button** | F3 | Emergency — forwarded to remote watchdog, broadcasts alert |
 
-## How It Works
+### Architecture
 
 ```
   TE300K Radio (runs in background after boot)
@@ -161,12 +166,11 @@ the server has — either the shared `SECRET` or that radio's entry in
 
 **2d. Download the porto-watchdog binary**
 
-Go to the [Actions tab](../../actions) on GitHub, click the latest
-successful **Build and Push** run, scroll to **Artifacts**, and download
-**porto-watchdog-arm**. Unzip it — the file inside is `porto-watchdog`.
+Grab `porto-watchdog` from the [latest release](../../releases/latest).
 
-Alternatively, if there is a tagged release, grab it from the
-[Releases page](../../releases).
+Alternatively, go to the [Actions tab](../../actions), click the latest
+successful **Build and Push** run, scroll to **Artifacts**, and download
+**porto-watchdog-arm**.
 
 **2e. Push files to the radio**
 
@@ -199,6 +203,7 @@ Reboot the radio. On boot, `pttbridge.apk` automatically:
 1. Starts the PTT socket service
 2. Launches the `porto-watchdog` local watchdog daemon
 3. Opens Mumla and connects to your Mumble server
+4. Returns to the home screen after connecting
 
 Test everything:
 - **Knob** — turn it, you should hear the channel name announced
@@ -248,7 +253,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `CHANNELS_SKIP` | *(empty)* | Channel names to skip (comma-separated) |
 | `ANNOUNCE_ENABLED` | true | TTS channel name on switch |
 | `ANNOUNCE_FORMAT` | {channel} | Channel announce template |
-| `EMERGENCY_FORMAT` | alert alert | Emergency broadcast message |
+| `EMERGENCY_FORMAT` | alert alert | Emergency broadcast message (`{username}` supported) |
 | `IDENT_FORMAT` | {username} | Ident broadcast template |
 | `CONNECT_MESSAGE_ENABLED` | true | Send message when a radio joins |
 | `CONNECT_MESSAGE_FORMAT` | {username} {channel} connected | Connect message template |
@@ -283,10 +288,11 @@ must be re-keyed.
 | `channel_bot.py` | Docker | Remote watchdog server |
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
-| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge |
+| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect |
 
 Binaries are built automatically by CI — download `porto-watchdog` from
-the [Actions](../../actions) tab (artifact: `porto-watchdog-arm`).
+the [latest release](../../releases/latest) or the
+[Actions](../../actions) tab (artifact: `porto-watchdog-arm`).
 
 ## Troubleshooting
 
@@ -300,7 +306,7 @@ If not running: `adb shell am startservice -a com.pttbridge.START`
 **Channel switch / emergency / ident not working** —
 Check `knob.conf` on the radio: `host` must be reachable from the
 radio's network. Check UDP port 4378 is open. Check remote watchdog
-container logs.
+container logs: `docker logs porto-watchdog`.
 
 **"HMAC verification failed"** —
 `secret` in `knob.conf` must match the server's `SECRET` or that
@@ -317,10 +323,15 @@ Use `P*` wildcards if the name varies.
 Grant Move permission in Mumble ACL for the bot user.
 
 **Auto-start not working after reboot** —
-Check logcat: `adb shell 'logcat -d | grep -i pttbridge'`
-If you see "Service Intent must be explicit", the APK needs to be updated.
+Check logcat: `adb shell logcat -d | grep -i pttbridge`
 Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog`
 and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
+
+**DNS not resolving on the radio** —
+Check logcat: `adb shell logcat -d | grep porto-watchdog`
+If you see "DNS not ready", the radio's WiFi may not be connected yet.
+The binary retries DNS on every keypress. You can also use an IP address
+directly in `knob.conf` to bypass DNS entirely.
 
 **No TTS** —
 Enable Text-to-Speech in Mumla settings on the radio.

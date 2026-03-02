@@ -4,7 +4,7 @@ After years of using cheap Baofeng radios with poor audio quality and limited ra
 
 You can't have it all, so some concessions had to be made. The non-negotiable requirement: the radio must run Android, so third-party VoIP apps can be installed. This makes it possible to self-host voice services and encrypt communications end-to-end, keeping things private for family and friends. A bonus would be enough disk space, memory, and CPU headroom to run something like a GPS tracker feeding into CivTAK.
 
-The TE300K checked those boxes. Porto Watchdog is the software that ties it all together - turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
+The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthropic.com) AI I have created Porto Watchdog - the software that ties it all together, turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
 
 ![Demo](demo.gif)
 

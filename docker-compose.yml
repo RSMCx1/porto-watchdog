@@ -44,6 +44,10 @@ services:
       EMERGENCY_FORMAT: "alert alert"
       IDENT_FORMAT: "{username}"
 
+      # -- Connect message (sent to radio user when they join the server) --
+      CONNECT_MESSAGE_ENABLED: "true"
+      CONNECT_MESSAGE_FORMAT: "{username} {channel} connected"
+
       # -- Logging --
       LOG_LEVEL: INFO
 

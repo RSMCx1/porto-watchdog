@@ -250,6 +250,8 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `ANNOUNCE_FORMAT` | {channel} | Channel announce template |
 | `EMERGENCY_FORMAT` | alert alert | Emergency broadcast message |
 | `IDENT_FORMAT` | {username} | Ident broadcast template |
+| `CONNECT_MESSAGE_ENABLED` | true | Send message when a radio joins |
+| `CONNECT_MESSAGE_FORMAT` | {username} {channel} connected | Connect message template |
 | `LOG_LEVEL` | INFO | DEBUG, INFO, WARNING, ERROR |
 | `RADIOS` | *(required)* | Radio-to-user mapping |
 

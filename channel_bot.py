@@ -343,7 +343,11 @@ class ChannelBot:
             if name:
                 self.announce(radio_id, name, cid)
         elif cmd == 'E':
-            msg = self.config['emergency_format']
+            fmt = self.config['emergency_format']
+            username = self.radio_map.get(radio_id, radio_id)
+            user = self.channel_mgr.find_user_by_name(username)
+            actual_name = user['name'] if user else username
+            msg = fmt.format(username=actual_name)
             log.warning("[%s] EMERGENCY triggered", radio_id)
             self.broadcast_to_channel(radio_id, msg)
         elif cmd == 'I':

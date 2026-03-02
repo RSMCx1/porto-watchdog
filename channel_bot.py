@@ -261,7 +261,7 @@ class ChannelBot:
         host = self.config['mumble_host']
         port = self.config['mumble_port']
         username = self.config['bot_username']
-        password = self.config['bot_password']
+        password = self.config['mumble_server_password']
         certfile, keyfile = self.ensure_certificate()
 
         log.info("Connecting to %s:%d as '%s'...", host, port, username)
@@ -435,7 +435,7 @@ def load_env_config():
         'mumble_host': os.environ.get('MUMBLE_HOST', '127.0.0.1'),
         'mumble_port': int(os.environ.get('MUMBLE_PORT', '64738')),
         'bot_username': os.environ.get('BOT_USERNAME', 'ChannelBot'),
-        'bot_password': os.environ.get('BOT_PASSWORD', ''),
+        'mumble_server_password': os.environ.get('MUMBLE_SERVER_PASSWORD', ''),
         'secret': os.environ.get('SECRET', ''),
         'allowed_ips': os.environ.get('ALLOWED_IPS', ''),
         'udp_port': int(os.environ.get('UDP_PORT', '4378')),

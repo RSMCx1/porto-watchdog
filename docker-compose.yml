@@ -13,7 +13,7 @@ services:
       MUMBLE_HOST: zip-mumble-server
       MUMBLE_PORT: "64738"
       BOT_USERNAME: ChannelBot
-      BOT_PASSWORD: ""
+      MUMBLE_SERVER_PASSWORD: ""
 
       # -- Security --
       # Generate with: docker run --rm rsmcx1/porto-watchdog --gen-secret

@@ -236,7 +236,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `MUMBLE_HOST` | 127.0.0.1 | Mumble server hostname |
 | `MUMBLE_PORT` | 64738 | Mumble server port |
 | `BOT_USERNAME` | ChannelBot | Bot display name in Mumble |
-| `BOT_PASSWORD` | *(empty)* | Bot password |
+| `MUMBLE_SERVER_PASSWORD` | *(empty)* | Mumble server password |
 | `SECRET` | *(required)* | HMAC shared secret (fallback for all radios) |
 | `SECRETS` | *(empty)* | Per-radio secrets: `radio01=key1,radio02=key2` |
 | `ALLOWED_IPS` | *(empty=any)* | Source IP allowlist |

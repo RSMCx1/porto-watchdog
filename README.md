@@ -80,6 +80,29 @@ interaction. PTT is handled entirely on the radio (low latency).
 Channel switching and alerts are forwarded as signed UDP packets to
 the remote watchdog, which executes them on the Mumble server.
 
+### The Mumble bot
+
+The remote watchdog is a Python bot built on
+[pymumble](https://github.com/azlux/pymumble). It connects to your
+Mumble server as a regular user, listens for signed UDP packets from
+the radios, and translates them into Mumble actions: moving users
+between channels, sending text messages (which Mumla reads aloud via
+TTS), and broadcasting emergency or ident alerts.
+
+Every packet that arrives is verified before anything happens. The bot
+checks the HMAC-SHA256 signature against the radio's secret, rejects
+anything older than 30 seconds to prevent replay attacks, and
+optionally restricts source IPs. Per-radio secrets mean you can revoke
+a single compromised radio without touching the others. Unsigned,
+expired, or unknown packets are silently dropped - nothing gets
+through without a valid signature.
+
+The bot auto-generates a TLS client certificate on first start and
+stores it in a Docker volume. This gives it a persistent identity on
+the Mumble server, so ACL permissions (like the ability to move users)
+survive container restarts. All configuration is done through
+environment variables - no config files to manage.
+
 ## Making It Work - The Hard Parts
 
 ### Platform signing: becoming a system app

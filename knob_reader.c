@@ -39,9 +39,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-/* netdb.h (getaddrinfo) intentionally not included — hangs on Android static */
 #include <signal.h>
 #include <linux/input.h>
 
@@ -256,36 +256,229 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
                 pkt, PAYLOAD_LEN, pkt + HMAC_OFFSET);
 }
 
+/* ---- Android DNS resolution ----
+ *
+ * glibc static binaries on Android cannot use getaddrinfo() (hangs forever
+ * because glibc's NSS can't talk to Android's netd daemon) or popen()
+ * (hardcodes /bin/sh which doesn't exist — Android uses /system/bin/sh).
+ *
+ * Instead we do what c-ares/curl do on Android:
+ *   1. Get the DNS server IP from `getprop net.dns1` via fork+exec
+ *   2. Send a raw UDP DNS query (RFC 1035) directly to port 53
+ *   3. Parse the A record from the response
+ *   4. Fall back to 8.8.8.8 / 1.1.1.1 if getprop fails
+ *   5. Last resort: fork+exec ping (uses Android's native resolver)
+ */
+
+/* Run a command via fork+exec+pipe and read its stdout.
+ * Returns bytes read, or -1 on error. */
+static int exec_read(const char *prog, char *const argv[], char *buf, int bufsize) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execv(prog, argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    int total = 0;
+    while (total < bufsize - 1) {
+        int n = read(pipefd[0], buf + total, bufsize - 1 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    buf[total] = '\0';
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    return total;
+}
+
+/* Get Android's DNS server from system properties. */
+static int get_android_dns(struct in_addr *out) {
+    char buf[64];
+    char *argv[] = {(char *)"/system/bin/getprop", (char *)"net.dns1", NULL};
+
+    int n = exec_read("/system/bin/getprop", argv, buf, sizeof(buf));
+    if (n <= 0) return -1;
+
+    /* Trim trailing whitespace */
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
+        buf[--n] = '\0';
+
+    if (n == 0) return -1;
+    return inet_aton(buf, out) ? 0 : -1;
+}
+
+/* Encode hostname for DNS wire format: "a.b.c" → \1a\1b\1c\0 */
+static int dns_encode_name(const char *name, unsigned char *buf, int bufsize) {
+    const char *p = name;
+    int pos = 0;
+
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        int len = dot ? (int)(dot - p) : (int)strlen(p);
+        if (len == 0 || len > 63 || pos + 1 + len >= bufsize) return -1;
+        buf[pos++] = (unsigned char)len;
+        memcpy(buf + pos, p, len);
+        pos += len;
+        p += len;
+        if (*p == '.') p++;
+    }
+    if (pos >= bufsize) return -1;
+    buf[pos++] = 0;
+    return pos;
+}
+
+/* Send a raw UDP DNS A-record query and parse the response.
+ * Returns 0 on success, -1 on failure. */
+static int dns_query_a(struct in_addr dns_server, const char *hostname,
+                       struct in_addr *result) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+
+    struct timeval tv = {3, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* Build query */
+    unsigned char qbuf[512];
+    int qpos = 0;
+    unsigned short txid = (unsigned short)(time(NULL) ^ getpid());
+
+    /* Header */
+    qbuf[qpos++] = txid >> 8;   qbuf[qpos++] = txid & 0xFF;
+    qbuf[qpos++] = 0x01;        qbuf[qpos++] = 0x00;  /* RD=1 */
+    qbuf[qpos++] = 0x00;        qbuf[qpos++] = 0x01;  /* QDCOUNT=1 */
+    qbuf[qpos++] = 0x00;        qbuf[qpos++] = 0x00;
+    qbuf[qpos++] = 0x00;        qbuf[qpos++] = 0x00;
+    qbuf[qpos++] = 0x00;        qbuf[qpos++] = 0x00;
+
+    /* Question: encoded name + QTYPE(A=1) + QCLASS(IN=1) */
+    int nlen = dns_encode_name(hostname, qbuf + qpos, sizeof(qbuf) - qpos - 4);
+    if (nlen < 0) { close(sock); return -1; }
+    qpos += nlen;
+    qbuf[qpos++] = 0x00; qbuf[qpos++] = 0x01;  /* A */
+    qbuf[qpos++] = 0x00; qbuf[qpos++] = 0x01;  /* IN */
+
+    /* Send to DNS server port 53 */
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(53);
+    sa.sin_addr = dns_server;
+
+    if (sendto(sock, qbuf, qpos, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    /* Receive response */
+    unsigned char resp[512];
+    int rlen = recvfrom(sock, resp, sizeof(resp), 0, NULL, NULL);
+    close(sock);
+
+    if (rlen < 12) return -1;
+    /* Verify: same txid, QR=1, RCODE=0 */
+    if (resp[0] != qbuf[0] || resp[1] != qbuf[1]) return -1;
+    if (!(resp[2] & 0x80)) return -1;
+    if ((resp[3] & 0x0F) != 0) return -1;
+
+    int ancount = (resp[6] << 8) | resp[7];
+    if (ancount == 0) return -1;
+
+    /* Skip question section */
+    int pos = 12;
+    while (pos < rlen) {
+        if ((resp[pos] & 0xC0) == 0xC0) { pos += 2; break; }
+        if (resp[pos] == 0) { pos++; break; }
+        pos += 1 + resp[pos];
+    }
+    pos += 4;  /* QTYPE + QCLASS */
+
+    /* Parse answer records, find first A record */
+    int i;
+    for (i = 0; i < ancount && pos + 12 <= rlen; i++) {
+        /* Skip NAME (pointer or label) */
+        if ((resp[pos] & 0xC0) == 0xC0) {
+            pos += 2;
+        } else {
+            while (pos < rlen && resp[pos] != 0) pos += 1 + resp[pos];
+            pos++;
+        }
+
+        if (pos + 10 > rlen) break;
+        int rtype = (resp[pos] << 8) | resp[pos+1];
+        int rdlength = (resp[pos+8] << 8) | resp[pos+9];
+        pos += 10;
+
+        if (rtype == 1 && rdlength == 4 && pos + 4 <= rlen) {
+            memcpy(result, resp + pos, 4);
+            return 0;
+        }
+        pos += rdlength;
+    }
+
+    return -1;
+}
+
 /* Resolve hostname to IPv4 address.
- * This binary runs on Android where getaddrinfo() in static binaries
- * hangs forever (glibc can't talk to Android's netd). Use ping instead,
- * which goes through Android's native resolver and always works.
+ * Strategy: raw IP → Android DNS → Google/Cloudflare DNS → ping fallback.
  * Returns 0 on success, -1 on failure. */
 static int resolve_hostname(const char *hostname, struct in_addr *out) {
-    char cmd[512], line[256];
+    struct in_addr dns_server;
 
-    /* Fast path: already an IP address? */
+    /* Fast path: already an IP address */
     if (inet_aton(hostname, out))
         return 0;
 
-    /* Use ping to resolve via Android's system DNS resolver.
-     * Output line 1: "PING hostname (1.2.3.4) 56(84) bytes of data." */
-    snprintf(cmd, sizeof(cmd), "ping -c1 -W2 %s 2>/dev/null", hostname);
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
+    /* Try Android's configured DNS server (getprop net.dns1) */
+    if (get_android_dns(&dns_server) == 0) {
+        printf("porto-watchdog: DNS server from Android: %s\n", inet_ntoa(dns_server));
+        fflush(stdout);
+        if (dns_query_a(dns_server, hostname, out) == 0)
+            return 0;
+    }
 
-    int ok = -1;
-    if (fgets(line, sizeof(line), f)) {
-        char *open_paren = strchr(line, '(');
-        char *close_paren = open_paren ? strchr(open_paren, ')') : NULL;
-        if (open_paren && close_paren) {
-            *close_paren = '\0';
-            if (inet_aton(open_paren + 1, out))
-                ok = 0;
+    /* Fallback: well-known public DNS servers */
+    inet_aton("8.8.8.8", &dns_server);
+    if (dns_query_a(dns_server, hostname, out) == 0)
+        return 0;
+
+    inet_aton("1.1.1.1", &dns_server);
+    if (dns_query_a(dns_server, hostname, out) == 0)
+        return 0;
+
+    /* Last resort: ping via fork+exec (uses Android's bionic resolver) */
+    {
+        char line[256];
+        char *argv[] = {(char *)"/system/bin/ping", (char *)"-c1",
+                        (char *)"-W2", (char *)hostname, NULL};
+
+        int n = exec_read("/system/bin/ping", argv, line, sizeof(line));
+        if (n > 0) {
+            char *op = strchr(line, '(');
+            char *cp = op ? strchr(op, ')') : NULL;
+            if (op && cp) {
+                *cp = '\0';
+                if (inet_aton(op + 1, out))
+                    return 0;
+            }
         }
     }
-    pclose(f);
-    return ok;
+
+    return -1;
 }
 
 /* Try to resolve DNS and enable UDP. Rate-limited to once per DNS_RETRY_MS.

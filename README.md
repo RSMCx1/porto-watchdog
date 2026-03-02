@@ -379,4 +379,5 @@ the [latest release](../../releases/latest) or the
 ## Roadmap
 
 - **GPS tracking** - enable GPS functionality on the radios for location sharing, useful for integration with platforms like CivTAK for shared situational awareness
+- **LED control** - adjust LED behavior based on external input and user preferences
 - **Home screen LCD** - replace the stock home screen with a custom display showing current channel, signal status, and radio info on the TE300K's small screen

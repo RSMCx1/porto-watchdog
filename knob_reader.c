@@ -260,7 +260,7 @@ static void build_packet(unsigned char pkt[PKT_SIZE], char cmd) {
  *
  * glibc static binaries on Android cannot use getaddrinfo() (hangs forever
  * because glibc's NSS can't talk to Android's netd daemon) or popen()
- * (hardcodes /bin/sh which doesn't exist — Android uses /system/bin/sh).
+ * (hardcodes /bin/sh which doesn't exist - Android uses /system/bin/sh).
  *
  * Instead we do what c-ares/curl do on Android:
  *   1. Get the DNS server IP from `getprop net.dns1` via fork+exec
@@ -590,7 +590,7 @@ int main(int argc, char *argv[]) {
      * Boot-resilient startup sequence:
      *   1. Wait for input devices (kernel may not have initialized them yet)
      *   2. Check PTT socket (local)
-     *   3. Try DNS once (non-blocking — retries lazily on each keypress)
+     *   3. Try DNS once (non-blocking - retries lazily on each keypress)
      */
 
     /* 1. Open button/PTT device (event3) - retry at boot */
@@ -636,7 +636,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 3. Try DNS once — if it fails, we'll retry on each keypress (no blocking) */
+    /* 3. Try DNS once - if it fails, we'll retry on each keypress (no blocking) */
     if (want_udp) {
         if (!try_resolve_udp()) {
             printf("porto-watchdog: DNS not ready yet, will retry on keypress\n");

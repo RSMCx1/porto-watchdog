@@ -1,19 +1,19 @@
 # Porto Watchdog
 
-After years of using cheap Baofeng radios with poor audio quality and limited range, it was time to step up to PTT over Cellular (PoC). Unfortunately, most PoC radios ship with locked-down firmware restricted to a handful of closed-source apps that require monthly license fees. Finding something worth buying when you only use it a few times a year — and want to keep communications private — is a real challenge.
+After years of using cheap Baofeng radios with poor audio quality and limited range, it was time to step up to PTT over Cellular (PoC). Unfortunately, most PoC radios ship with locked-down firmware restricted to a handful of closed-source apps that require monthly license fees. Finding something worth buying when you only use it a few times a year - and want to keep communications private - is a real challenge.
 
 You can't have it all, so some concessions had to be made. The non-negotiable requirement: the radio must run Android, so third-party VoIP apps can be installed. This makes it possible to self-host voice services and encrypt communications end-to-end, keeping things private for family and friends. A bonus would be enough disk space, memory, and CPU headroom to run something like a stripped-down ATAK instance as a GPS tracker feeding into CivTAK.
 
-The TE300K checked those boxes. Porto Watchdog is the software that ties it all together — turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
+The TE300K checked those boxes. Porto Watchdog is the software that ties it all together - turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
 
 ## How It Works
 
 Two watchdogs work together:
 
-- **Local watchdog** (`porto-watchdog` binary) — runs in the background on
+- **Local watchdog** (`porto-watchdog` binary) - runs in the background on
   each radio, intercepts hardware key events, handles PTT locally and
   forwards knob/button presses to the remote watchdog over UDP.
-- **Remote watchdog** (`porto-watchdog` Docker container) — runs on your
+- **Remote watchdog** (`porto-watchdog` Docker container) - runs on your
   server, receives key events from all radios, switches channels, and
   broadcasts emergency/ident messages through the Mumble server.
 
@@ -22,10 +22,10 @@ Two watchdogs work together:
 | Input | Key | What happens |
 |-------|-----|--------------|
 | **PTT button** | F1 | Hold to talk, release to stop (handled locally via Mumla) |
-| **Knob clockwise** | F14 | Next channel — forwarded to remote watchdog, TTS announces |
-| **Knob counter-clockwise** | F13 | Previous channel — forwarded to remote watchdog |
-| **Side button** | F2 | Ident — forwarded to remote watchdog, announces your name |
-| **Emergency button** | F3 | Emergency — forwarded to remote watchdog, broadcasts alert |
+| **Knob clockwise** | F14 | Next channel - forwarded to remote watchdog, TTS announces |
+| **Knob counter-clockwise** | F13 | Previous channel - forwarded to remote watchdog |
+| **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name |
+| **Emergency button** | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
 
 ### Architecture
 
@@ -72,15 +72,69 @@ Two watchdogs work together:
   └──────────────────────────────────────────────┘
 ```
 
-The local watchdog runs as a background daemon — it starts on boot,
+The local watchdog runs as a background daemon - it starts on boot,
 reads hardware input events continuously, and never needs user
 interaction. PTT is handled entirely on the radio (low latency).
 Channel switching and alerts are forwarded as signed UDP packets to
 the remote watchdog, which executes them on the Mumble server.
 
+## Making It Work - The Hard Parts
+
+### Platform signing: becoming a system app
+
+The local watchdog needs to read raw hardware events from `/dev/input/event3`
+(buttons) and `/dev/input/event4` (knob). On Android, those device files are
+owned by `root:input` - regular apps can't touch them. The
+`android.permission.DIAGNOSTIC` permission grants access to the `input` group,
+but it's a signature-level permission: Android only grants it if the APK is
+signed with the same key as the firmware itself.
+
+Here's the trick: many OEMs - including whoever builds the TE300K firmware -
+never bother generating their own platform signing keys. They ship with the
+default AOSP test keys that Google publishes in the Android source tree. Those
+keys are public. Anyone can download `platform.x509.pem` and `platform.pk8`
+from AOSP and sign an APK with them.
+
+That's exactly what `pttbridge.apk` does. It's signed with the AOSP default
+platform keys, and the TE300K firmware accepts it as a trusted system app.
+This gives us:
+
+- **`android.permission.DIAGNOSTIC`** - access to `/dev/input/*` devices, so
+  the watchdog binary can read knob turns and button presses directly from
+  the kernel
+- **`RECEIVE_BOOT_COMPLETED`** - fires reliably on every boot, even on
+  locked-down firmware that might throttle or suppress third-party boot
+  receivers
+- **`Runtime.exec()`** - the binary launched by the service inherits the
+  app's UID and group memberships, so it can open the input devices without
+  root
+
+Without platform signing, none of this works. The binary would get
+"Permission denied" on the input devices, and you'd need root access to the
+radio - which the TE300K doesn't offer.
+
+### Unlocking app installs: `persist.telo.install`
+
+Out of the box, the TE300K won't let you install apps. Running `adb install`
+fails silently or returns an error. The firmware's package installer has a
+gatekeeper: a system property that must be set before sideloading is allowed.
+
+Finding it required dumping all system properties (`adb shell getprop`) and
+looking for anything Telo/Inrico-specific. Buried in the output:
+`persist.telo.install` - a custom property the firmware checks before
+allowing APK installs. Setting it to `enable` flips the switch:
+
+```bash
+adb shell setprop persist.telo.install enable
+```
+
+The `persist.` prefix means it survives reboots - set it once and forget it.
+Without this, there's no way to get Mumla or pttbridge onto the radio short
+of modifying the system partition.
+
 ## Setup Guide
 
-### Step 1: Server — Deploy the remote watchdog
+### Step 1: Server - Deploy the remote watchdog
 
 Do this once on your server.
 
@@ -126,11 +180,16 @@ first time:
 The remote watchdog listens on UDP port **4378**. Make sure your
 radios can reach it.
 
-### Step 2: Radio — One-time onboarding
+### Step 2: Radio - One-time onboarding
 
-Connect the TE300K via USB. Do this once per radio, then unplug and go.
+You need [Android SDK Platform Tools](https://developer.android.com/tools/releases/platform-tools)
+installed on your computer for the `adb` command. Download the ZIP, extract
+it, and make sure `adb` is in your PATH. Connect the TE300K via USB.
 
 **2a. Unlock app installs**
+
+The TE300K blocks sideloading by default (see [above](#unlocking-app-installs-persistteloinstall)).
+Flip the switch:
 
 ```bash
 adb shell setprop persist.telo.install enable
@@ -161,7 +220,7 @@ button_device=/dev/input/event3  # button input (don't change)
 ```
 
 Each radio needs a **unique `radio_id`**. The `secret` must match what
-the server has — either the shared `SECRET` or that radio's entry in
+the server has - either the shared `SECRET` or that radio's entry in
 `SECRETS`.
 
 **2d. Download the porto-watchdog binary**
@@ -197,6 +256,13 @@ Open Mumla on the radio, add your Mumble server, and enable
 **Text-to-Speech** in settings so channel names and alerts are
 read aloud through the speaker.
 
+**TTS and the bot name:** Mumla's TTS reads incoming text messages as
+"*BotName* says *message*". The `BOT_USERNAME` on the server controls
+what name is spoken before every announcement. The default `ChannelBot`
+works fine, but you can set it to something shorter or more natural
+(e.g. `Radio`) so announcements sound cleaner - "Radio says General"
+instead of "ChannelBot says General".
+
 ### Step 3: Verify
 
 Reboot the radio. On boot, `pttbridge.apk` automatically:
@@ -206,10 +272,10 @@ Reboot the radio. On boot, `pttbridge.apk` automatically:
 4. Returns to the home screen after connecting
 
 Test everything:
-- **Knob** — turn it, you should hear the channel name announced
-- **PTT** — hold the button, your voice should transmit
-- **Side button (F2)** — your name gets announced to the channel
-- **Emergency (F3)** — "alert alert" broadcasts to the channel
+- **Knob** - turn it, you should hear the channel name announced
+- **PTT** - hold the button, your voice should transmit
+- **Side button (F2)** - your name gets announced to the channel
+- **Emergency (F3)** - "alert alert" broadcasts to the channel
 
 **Done. Unplug the USB cable. The radio is onboarded.**
 
@@ -226,7 +292,7 @@ RADIOS="radio01=TE300K,radio02=TE300K-2,radio03=TE300K-3"
 ## RADIOS Format
 
 Comma-separated `radio_id=mumla_username` pairs.
-Wildcards supported — `*` matches anything, `?` matches one character:
+Wildcards supported - `*` matches anything, `?` matches one character:
 
 ```
 RADIOS="radio01=TE300K"                        # exact match
@@ -290,48 +356,48 @@ must be re-keyed.
 | `docker/Dockerfile` | Docker | Container build |
 | `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect |
 
-Binaries are built automatically by CI — download `porto-watchdog` from
+Binaries are built automatically by CI - download `porto-watchdog` from
 the [latest release](../../releases/latest) or the
 [Actions](../../actions) tab (artifact: `porto-watchdog-arm`).
 
 ## Troubleshooting
 
-**Apps won't install** —
+**Apps won't install** -
 `adb shell setprop persist.telo.install enable`
 
-**PTT not working** —
+**PTT not working** -
 `adb shell dumpsys activity services | grep pttbridge`
 If not running: `adb shell am startservice -a com.pttbridge.START`
 
-**Channel switch / emergency / ident not working** —
+**Channel switch / emergency / ident not working** -
 Check `knob.conf` on the radio: `host` must be reachable from the
 radio's network. Check UDP port 4378 is open. Check remote watchdog
 container logs: `docker logs porto-watchdog`.
 
-**"HMAC verification failed"** —
+**"HMAC verification failed"** -
 `secret` in `knob.conf` must match the server's `SECRET` or that
 radio's entry in `SECRETS`.
 
-**"Replay rejected"** —
+**"Replay rejected"** -
 Radio clock is off. Check: `adb shell date`
 
-**"User not found"** —
+**"User not found"** -
 Username in `RADIOS` must match Mumla's connection name (case-sensitive).
 Use `P*` wildcards if the name varies.
 
-**Bot can't move users** —
+**Bot can't move users** -
 Grant Move permission in Mumble ACL for the bot user.
 
-**Auto-start not working after reboot** —
+**Auto-start not working after reboot** -
 Check logcat: `adb shell logcat -d | grep -i pttbridge`
 Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog`
 and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
 
-**DNS not resolving on the radio** —
+**DNS not resolving on the radio** -
 Check logcat: `adb shell logcat -d | grep porto-watchdog`
 If you see "DNS not ready", the radio's WiFi may not be connected yet.
 The binary retries DNS on every keypress. You can also use an IP address
 directly in `knob.conf` to bypass DNS entirely.
 
-**No TTS** —
+**No TTS** -
 Enable Text-to-Speech in Mumla settings on the radio.

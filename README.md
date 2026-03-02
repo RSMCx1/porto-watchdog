@@ -2,7 +2,7 @@
 
 After years of using cheap Baofeng radios with poor audio quality and limited range, it was time to step up to PTT over Cellular (PoC). Unfortunately, most PoC radios ship with locked-down firmware restricted to a handful of closed-source apps that require monthly license fees. Finding something worth buying when you only use it a few times a year - and want to keep communications private - is a real challenge.
 
-You can't have it all, so some concessions had to be made. The non-negotiable requirement: the radio must run Android, so third-party VoIP apps can be installed. This makes it possible to self-host voice services and encrypt communications end-to-end, keeping things private for family and friends. A bonus would be enough disk space, memory, and CPU headroom to run something like a stripped-down ATAK instance as a GPS tracker feeding into CivTAK.
+You can't have it all, so some concessions had to be made. The non-negotiable requirement: the radio must run Android, so third-party VoIP apps can be installed. This makes it possible to self-host voice services and encrypt communications end-to-end, keeping things private for family and friends. A bonus would be enough disk space, memory, and CPU headroom to run something like a GPS tracker feeding into CivTAK.
 
 The TE300K checked those boxes. Porto Watchdog is the software that ties it all together - turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
 
@@ -35,8 +35,8 @@ Two watchdogs work together:
   TE300K Radio (runs in background after boot)
   ┌────────────────────────────────────────────────┐
   │                                                │
-  │  PTT (F1)   Ident (F2)   Emergency (F3)        │
-  │  Knob CW (F14)     Knob CCW (F13)              │
+  │      PTT (F1)   Ident (F2)   Emergency (F3)    │
+  │        Knob CW (F14)     Knob CCW (F13)        │
   │       │         │         │                    │
   │  ┌────┴─────────┴─────────┴─────────────────┐  │
   │  │    porto-watchdog (local watchdog)       │  │
@@ -260,10 +260,11 @@ read aloud through the speaker.
 
 **TTS and the bot name:** Mumla's TTS reads incoming text messages as
 "*BotName* says *message*". The `BOT_USERNAME` on the server controls
-what name is spoken before every announcement. The default `ChannelBot`
-works fine, but you can set it to something shorter or more natural
-(e.g. `Radio`) so announcements sound cleaner - "Radio says General"
-instead of "ChannelBot says General".
+what gets spoken before every announcement. You have a few options:
+pick something short and natural (e.g. `Radio` - you'd hear "Radio
+says General"), or silence the bot name entirely by setting it to a
+character that TTS ignores (e.g. `|`). With `|` as the bot name, TTS
+just reads the message itself with no prefix. That's what I use.
 
 ### Step 3: Verify
 
@@ -364,48 +365,18 @@ the [latest release](../../releases/latest) or the
 
 ## Troubleshooting
 
-**Apps won't install** -
-`adb shell setprop persist.telo.install enable`
-
-**PTT not working** -
-`adb shell dumpsys activity services | grep pttbridge`
-If not running: `adb shell am startservice -a com.pttbridge.START`
-
-**Channel switch / emergency / ident not working** -
-Check `knob.conf` on the radio: `host` must be reachable from the
-radio's network. Check UDP port 4378 is open. Check remote watchdog
-container logs: `docker logs porto-watchdog`.
-
-**"HMAC verification failed"** -
-`secret` in `knob.conf` must match the server's `SECRET` or that
-radio's entry in `SECRETS`.
-
-**"Replay rejected"** -
-Radio clock is off. Check: `adb shell date`
-
-**"User not found"** -
-Username in `RADIOS` must match Mumla's connection name (case-sensitive).
-Use `P*` wildcards if the name varies.
-
-**Bot can't move users** -
-Grant Move permission in Mumble ACL for the bot user.
-
-**Auto-start not working after reboot** -
-Check logcat: `adb shell logcat -d | grep -i pttbridge`
-Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog`
-and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
-
-**DNS not resolving on the radio** -
-Check logcat: `adb shell logcat -d | grep porto-watchdog`
-If you see "DNS not ready", the radio's WiFi may not be connected yet.
-The binary retries DNS on every keypress. You can also use an IP address
-directly in `knob.conf` to bypass DNS entirely.
-
-**No TTS** -
-Enable Text-to-Speech in Mumla settings on the radio.
+- **Apps won't install** - `adb shell setprop persist.telo.install enable`
+- **PTT not working** - `adb shell dumpsys activity services | grep pttbridge`. If not running: `adb shell am startservice -a com.pttbridge.START`
+- **Channel switch / emergency / ident not working** - check `knob.conf` on the radio: `host` must be reachable from the radio's network. Check UDP port 4378 is open. Check remote watchdog container logs: `docker logs porto-watchdog`
+- **"HMAC verification failed"** - `secret` in `knob.conf` must match the server's `SECRET` or that radio's entry in `SECRETS`
+- **"Replay rejected"** - radio clock is off. Check: `adb shell date`
+- **"User not found"** - username in `RADIOS` must match Mumla's connection name (case-sensitive). Use `P*` wildcards if the name varies
+- **Bot can't move users** - grant Move permission in Mumble ACL for the bot user
+- **Auto-start not working after reboot** - check logcat: `adb shell logcat -d | grep -i pttbridge`. Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog` and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
+- **DNS not resolving on the radio** - check logcat: `adb shell logcat -d | grep porto-watchdog`. If you see "DNS not ready", the radio's WiFi may not be connected yet. The binary retries DNS on every keypress. You can also use an IP address directly in `knob.conf` to bypass DNS entirely
+- **No TTS** - enable Text-to-Speech in Mumla settings on the radio
 
 ## Roadmap
 
-- **GPS tracking** - report radio positions over the network so you can see where everyone is on a map
-- **CivTAK integration** - feed location data into CivTAK/ATAK for shared situational awareness on Android Team Awareness Kit
+- **GPS tracking** - enable GPS functionality on the radios for location sharing, useful for integration with platforms like CivTAK for shared situational awareness
 - **Home screen LCD** - replace the stock home screen with a custom display showing current channel, signal status, and radio info on the TE300K's small screen

@@ -42,6 +42,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <signal.h>
 #include <linux/input.h>
 
 /* ---- Minimal SHA-256 + HMAC-SHA256 (no OpenSSL needed) ---- */
@@ -287,7 +288,7 @@ static int load_config(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    int btn_fd, knob_fd = -1, udp_fd = -1, ptt_fd = -1;
+    int btn_fd, knob_fd = -1, udp_fd = -1;
     struct sockaddr_in dest;
     struct input_event ev;
     long long last_knob_send = 0;
@@ -296,7 +297,10 @@ int main(int argc, char *argv[]) {
     struct pollfd fds[2];
     int nfds;
     int config_loaded = 0;
-    int ptt_connected = 0;
+
+    /* Ignore SIGPIPE: the PTT socket server closes after each read,
+     * so writes to a closed socket must return EPIPE, not kill us */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Load config: explicit -f, or auto-detect default path */
     if (argc == 3 && strcmp(argv[1], "-f") == 0) {
@@ -362,21 +366,14 @@ int main(int argc, char *argv[]) {
                     cfg_device);
     }
 
-    /* 2. Connect PTT socket (retry — APK service may still be starting) */
+    /* 2. Check PTT socket availability (connect-per-event, no persistent connection) */
     {
-        int retries;
-        for (retries = 0; retries < 60; retries++) {
-            ptt_fd = ptt_connect();
-            if (ptt_fd >= 0) {
-                ptt_connected = 1;
-                break;
-            }
-            if (retries == 0)
-                fprintf(stderr, "porto-watchdog: waiting for PTT socket service...\n");
-            usleep(500000); /* 500ms */
-        }
-        if (!ptt_connected) {
-            fprintf(stderr, "porto-watchdog: PTT socket not available yet (will retry on keypress)\n");
+        int test_fd = ptt_connect();
+        if (test_fd >= 0) {
+            close(test_fd);
+            printf("porto-watchdog: PTT socket available\n");
+        } else {
+            fprintf(stderr, "porto-watchdog: PTT socket not ready yet (will connect on keypress)\n");
         }
     }
 
@@ -419,9 +416,8 @@ int main(int argc, char *argv[]) {
 
     /* Startup banner */
     printf("porto-watchdog: TE300K all-in-one handler\n");
-    printf("porto-watchdog: buttons=%s (PTT%s%s%s)\n",
+    printf("porto-watchdog: buttons=%s (PTT%s%s)\n",
            cfg_button_device,
-           ptt_connected ? " [OK]" : " [N/A]",
            udp_enabled ? " emergency ident" : "",
            udp_enabled ? " [OK]" : "");
     if (knob_fd >= 0)
@@ -462,31 +458,17 @@ int main(int argc, char *argv[]) {
             }
 
             if (ev.type == EV_KEY) {
-                /* PTT: send both press (1) and release (0) */
+                /* PTT: connect-per-event (server closes after each read) */
                 if (ev.code == KEY_PTT && (ev.value == 1 || ev.value == 0)) {
-                    /* Try to reconnect if not connected */
-                    if (!ptt_connected) {
-                        ptt_fd = ptt_connect();
-                        if (ptt_fd >= 0) {
-                            ptt_connected = 1;
-                            fprintf(stderr, "porto-watchdog: PTT socket reconnected\n");
-                        }
-                    }
-                    if (ptt_connected) {
-                        if (ptt_send(ptt_fd, ev.value) < 0) {
-                            /* Socket died, try reconnecting once */
-                            close(ptt_fd);
-                            ptt_fd = ptt_connect();
-                            if (ptt_fd >= 0) {
-                                ptt_send(ptt_fd, ev.value);
-                            } else {
-                                ptt_connected = 0;
-                                fprintf(stderr, "porto-watchdog: PTT socket lost, will retry on next press\n");
-                            }
-                        }
+                    int ptt_fd = ptt_connect();
+                    if (ptt_fd >= 0) {
+                        ptt_send(ptt_fd, ev.value);
+                        close(ptt_fd);
                         printf("porto-watchdog: PTT %s\n",
                                ev.value ? "DOWN" : "UP");
                         fflush(stdout);
+                    } else {
+                        fprintf(stderr, "porto-watchdog: PTT socket unavailable\n");
                     }
                 }
                 /* Emergency & Ident: only on press (value 1), only if UDP enabled */
@@ -521,7 +503,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (udp_fd >= 0) close(udp_fd);
-    if (ptt_fd >= 0) close(ptt_fd);
     if (knob_fd >= 0) close(knob_fd);
     close(btn_fd);
     return 0;

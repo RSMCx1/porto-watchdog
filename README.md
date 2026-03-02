@@ -6,6 +6,8 @@ You can't have it all, so some concessions had to be made. The non-negotiable re
 
 The TE300K checked those boxes. Porto Watchdog is the software that ties it all together - turning the physical knob, buttons, and PTT into a seamless Mumble radio experience. Onboard a radio once, everything auto-starts on boot and runs forever.
 
+![Demo](demo.gif)
+
 ## How It Works
 
 Two watchdogs work together:

@@ -403,3 +403,9 @@ directly in `knob.conf` to bypass DNS entirely.
 
 **No TTS** -
 Enable Text-to-Speech in Mumla settings on the radio.
+
+## Roadmap
+
+- **GPS tracking** - report radio positions over the network so you can see where everyone is on a map
+- **CivTAK integration** - feed location data into CivTAK/ATAK for shared situational awareness on Android Team Awareness Kit
+- **Home screen LCD** - replace the stock home screen with a custom display showing current channel, signal status, and radio info on the TE300K's small screen

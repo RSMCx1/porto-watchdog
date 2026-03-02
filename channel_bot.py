@@ -270,6 +270,10 @@ class ChannelBot:
             certfile=certfile, keyfile=keyfile,
         )
         self.mumble.set_receive_sound(False)
+        self.mumble.callbacks.set_callback(
+            pymumble.constants.PYMUMBLE_CLBK_USERCREATED,
+            self.on_user_connected,
+        )
         self.mumble.start()
         self.mumble.is_ready()
         log.info("Connected!")
@@ -281,6 +285,23 @@ class ChannelBot:
             wrap_around=self.config['channels_wrap_around'],
             skip_channels=self.config['channels_skip'],
         )
+
+    def on_user_connected(self, user):
+        """Called when any user joins the server. Greet mapped radio users."""
+        username = user['name']
+        # Check if this user matches any radio mapping
+        for radio_id, pattern in self.radio_map.items():
+            if fnmatch.fnmatch(username, pattern) or username == pattern:
+                channel_id = user['channel_id']
+                channel = self.mumble.channels.get(channel_id)
+                channel_name = channel['name'] if channel else 'unknown'
+                msg = "%s %s connected" % (username, channel_name)
+                log.info("[%s] Radio connected: %s", radio_id, msg)
+                try:
+                    self.mumble.users[user['session']].send_text_message(msg)
+                except Exception as e:
+                    log.warning("Failed to send connect message: %s", e)
+                break
 
     def announce(self, radio_id, channel_name, channel_id):
         """Send channel name to the radio user via text message (TTS)."""

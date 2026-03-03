@@ -8,6 +8,21 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 
 ![Demo](demo.gif)
 
+## Features
+
+- **Push-to-talk** - press the physical PTT button on the radio and your voice goes out instantly, no app interaction needed
+- **Channel knob** - turn the knob on the radio to switch between channels, just like a traditional two-way radio
+- **Voice announcements** - the radio speaks the channel name out loud every time you switch, so you always know where you are without looking at the screen
+- **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker
+- **Ident** - press the side button and your name is announced to the channel, useful for roll calls or check-ins
+- **Connect notification** - when a radio powers on and joins the server, it receives a spoken confirmation with the current channel name
+- **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
+- **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
+- **Secured communications** - every command between the radio and server is cryptographically signed and verified, preventing anyone from injecting fake commands
+- **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
+- **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
+- **Server runs anywhere** - the server side runs as a Docker container with all settings configured through environment variables, making it easy to deploy on any machine or manage through Portainer
+
 ## How It Works
 
 Two watchdogs work together:

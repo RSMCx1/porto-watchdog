@@ -224,7 +224,10 @@ Persists across reboots. Only needed once per device.
 
 **2b. Install the apps**
 
-`pttbridge.apk` is included in this repo. Mumla is a separate download.
+Both APKs are included in this repo. [Mumla](https://github.com/quite/mumla)
+is an open-source Mumble client (GPL-3.0). You must use **version 3.6.15
+(build 110)** - newer versions crash on the second launch when acknowledging
+the changelog on Android 6.0. The correct version is included as `mumla.apk`.
 
 ```bash
 adb install pttbridge.apk
@@ -381,6 +384,7 @@ must be re-keyed.
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
 | `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect |
+| `mumla.apk` | Radio | Mumla v3.6.15 - open-source Mumble client ([GPL-3.0](https://github.com/quite/mumla)) |
 
 Binaries are built automatically by CI - download `porto-watchdog` from
 the [latest release](../../releases/latest) or the

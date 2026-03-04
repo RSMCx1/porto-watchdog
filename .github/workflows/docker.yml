@@ -2,7 +2,7 @@ name: Build and Push
 
 on:
   push:
-    branches: [main, savox-ts-rsm35-ppt]
+    branches: [main]
     tags: ['v*']
     paths-ignore:
       - '*.md'

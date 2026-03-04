@@ -20,3 +20,7 @@ device=/dev/input/event4
 # Input device - side buttons (KEY_F2=ident, KEY_F3=emergency)
 # Remove or leave empty to disable buttons
 button_device=/dev/input/event3
+
+# Input device - RSM PTT (telo_ptt, external speaker-mic)
+# Remove or leave empty to disable RSM PTT
+ptt_device=/dev/input/event2

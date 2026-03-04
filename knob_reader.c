@@ -5,7 +5,8 @@
  * key events, and routes them:
  *
  *   LOCAL (PTT → Mumla via pttbridge.apk socket):
- *     /dev/input/event3  KEY_F1 (59)  = PTT press/release
+ *     /dev/input/event2  KEY_F1 (59)  = RSM PTT press/release (telo_ptt)
+ *     /dev/input/event3  KEY_F1 (59)  = Body PTT press/release (gpio-keys)
  *
  *   REMOTE (UDP → porto-watchdog server container):
  *     /dev/input/event3  KEY_F2 (60)  = Ident broadcast
@@ -188,8 +189,9 @@ static char cfg_host[256]  = "";
 static int  cfg_port       = 4378;
 static char cfg_radio_id[RADIO_ID_LEN + 1] = "";
 static char cfg_secret[256] = "";
-static char cfg_device[256] = "/dev/input/event4";
-static char cfg_button_device[256] = "/dev/input/event3";
+static char cfg_device[256] = "/dev/input/event4";           /* knob */
+static char cfg_button_device[256] = "/dev/input/event3";    /* body buttons (gpio-keys) */
+static char cfg_ptt_device[256] = "/dev/input/event2";       /* RSM PTT (telo_ptt) */
 
 static int want_udp = 0;     /* config says we should use UDP */
 static int udp_enabled = 0;  /* DNS resolved, UDP is working */
@@ -541,6 +543,7 @@ static int load_config(const char *path) {
             else if (strcmp(key, "secret") == 0) strncpy(cfg_secret, val, sizeof(cfg_secret)-1);
             else if (strcmp(key, "device") == 0) strncpy(cfg_device, val, sizeof(cfg_device)-1);
             else if (strcmp(key, "button_device") == 0) strncpy(cfg_button_device, val, sizeof(cfg_button_device)-1);
+            else if (strcmp(key, "ptt_device") == 0) strncpy(cfg_ptt_device, val, sizeof(cfg_ptt_device)-1);
         }
     }
     fclose(f);
@@ -548,12 +551,12 @@ static int load_config(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    int btn_fd, knob_fd = -1;
+    int btn_fd, knob_fd = -1, ptt_fd_dev = -1;
     struct input_event ev;
     long long last_knob_send = 0;
     long long last_btn_send = 0;
     unsigned char pkt[PKT_SIZE];
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     int nfds;
     int config_loaded = 0;
 
@@ -625,6 +628,20 @@ int main(int argc, char *argv[]) {
                     cfg_device);
     }
 
+    /* Open RSM PTT device (event2) - optional, retry briefly */
+    {
+        int retries;
+        for (retries = 0; retries < 10; retries++) {
+            ptt_fd_dev = open(cfg_ptt_device, O_RDONLY);
+            if (ptt_fd_dev >= 0) break;
+            if (retries == 0)
+                fprintf(stderr, "porto-watchdog: waiting for %s ...\n", cfg_ptt_device);
+            sleep(1);
+        }
+        if (ptt_fd_dev < 0)
+            fprintf(stderr, "porto-watchdog: RSM PTT %s not available\n", cfg_ptt_device);
+    }
+
     /* 2. Check PTT socket availability (connect-per-event, no persistent connection) */
     {
         int test_fd = ptt_connect();
@@ -649,6 +666,8 @@ int main(int argc, char *argv[]) {
     printf("porto-watchdog: buttons=%s (PTT%s)\n",
            cfg_button_device,
            want_udp ? " emergency ident" : "");
+    if (ptt_fd_dev >= 0)
+        printf("porto-watchdog: rsm_ptt=%s\n", cfg_ptt_device);
     if (knob_fd >= 0)
         printf("porto-watchdog: knob=%s (channel switch%s)\n",
                cfg_device, want_udp ? "" : " [N/A]");
@@ -658,15 +677,26 @@ int main(int argc, char *argv[]) {
                udp_enabled ? "OK" : "waiting for DNS");
     fflush(stdout);
 
-    /* Set up poll: always have btn_fd, optionally knob_fd */
-    fds[0].fd = btn_fd;
-    fds[0].events = POLLIN;
-    nfds = 1;
+    /* Set up poll: btn_fd always present, knob_fd and ptt_fd_dev optional.
+     * Layout: fds[0]=buttons, fds[1]=knob (or RSM if no knob), fds[2]=RSM */
+    nfds = 0;
+    fds[nfds].fd = btn_fd;
+    fds[nfds].events = POLLIN;
+    nfds++;
+
+    int knob_poll_idx = -1, ptt_poll_idx = -1;
 
     if (knob_fd >= 0) {
-        fds[1].fd = knob_fd;
-        fds[1].events = POLLIN;
-        nfds = 2;
+        knob_poll_idx = nfds;
+        fds[nfds].fd = knob_fd;
+        fds[nfds].events = POLLIN;
+        nfds++;
+    }
+    if (ptt_fd_dev >= 0) {
+        ptt_poll_idx = nfds;
+        fds[nfds].fd = ptt_fd_dev;
+        fds[nfds].events = POLLIN;
+        nfds++;
     }
 
     /* Main event loop */
@@ -717,7 +747,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Knob events: event4 (channel-switch) */
-        if (nfds > 1 && (fds[1].revents & POLLIN)) {
+        if (knob_poll_idx >= 0 && (fds[knob_poll_idx].revents & POLLIN)) {
             ssize_t n = read(knob_fd, &ev, sizeof(ev));
             if (n < (ssize_t)sizeof(ev)) {
                 if (n < 0 && errno == EINTR) continue;
@@ -737,9 +767,33 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+
+        /* RSM PTT events: event2 (telo_ptt) */
+        if (ptt_poll_idx >= 0 && (fds[ptt_poll_idx].revents & POLLIN)) {
+            ssize_t n = read(ptt_fd_dev, &ev, sizeof(ev));
+            if (n < (ssize_t)sizeof(ev)) {
+                if (n < 0 && errno == EINTR) continue;
+                fprintf(stderr, "RSM PTT read error: %s\n", strerror(errno));
+                break;
+            }
+            if (ev.type == EV_KEY && ev.code == KEY_PTT
+                    && (ev.value == 1 || ev.value == 0)) {
+                int ptt_fd = ptt_connect();
+                if (ptt_fd >= 0) {
+                    ptt_send(ptt_fd, ev.value);
+                    close(ptt_fd);
+                    printf("porto-watchdog: RSM PTT %s\n",
+                           ev.value ? "DOWN" : "UP");
+                    fflush(stdout);
+                } else {
+                    fprintf(stderr, "porto-watchdog: PTT socket unavailable\n");
+                }
+            }
+        }
     }
 
     if (udp_fd >= 0) close(udp_fd);
+    if (ptt_fd_dev >= 0) close(ptt_fd_dev);
     if (knob_fd >= 0) close(knob_fd);
     close(btn_fd);
     return 0;

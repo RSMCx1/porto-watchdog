@@ -663,8 +663,10 @@ class TAKForwarder:
             self._seen_chat.clear()
             self._seen_chat.add(uid)
         try:
-            t = calendar.timegm(time.strptime(
-                ev.getAttribute('time').split('.')[0], '%Y-%m-%dT%H:%M:%S'))
+            # the server re-serializes times: with or without millis,
+            # always with a trailing Z
+            raw = ev.getAttribute('time').rstrip('Z').split('.')[0]
+            t = calendar.timegm(time.strptime(raw, '%Y-%m-%dT%H:%M:%S'))
         except ValueError:
             return
         if abs(time.time() - t) > self.CHAT_FRESH_S:

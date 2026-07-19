@@ -56,6 +56,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          tags: |
-            rsmcx1/porto-watchdog:latest
-            rsmcx1/porto-watchdog:${{ github.sha }}
+          # :latest is reserved for main (and release tags). Feature
+          # branch builds get their own tag so production never picks
+          # up branch code from a pull.
+          tags: ${{ github.ref == 'refs/heads/gps-tak-tracking'
+            && format('rsmcx1/porto-watchdog:gps,rsmcx1/porto-watchdog:{0}', github.sha)
+            || format('rsmcx1/porto-watchdog:latest,rsmcx1/porto-watchdog:{0}', github.sha) }}

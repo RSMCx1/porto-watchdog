@@ -162,6 +162,7 @@ class TAKForwarder:
         self.ca_file = config['tak_ca_file']
         self.cert_file = config['tak_cert_file']
         self.key_file = config['tak_key_file']
+        self.key_pass = config['tak_key_pass']
         self.cot_type = config['tak_cot_type']
         self.stale_s = config['tak_stale']
         self.team = config['tak_team']
@@ -190,7 +191,8 @@ class TAKForwarder:
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                 if self.cert_file:
-                    ctx.load_cert_chain(self.cert_file, self.key_file or None)
+                    ctx.load_cert_chain(self.cert_file, self.key_file or None,
+                                        self.key_pass or None)
                 sock = ctx.wrap_socket(sock, server_hostname=self.host)
             sock.settimeout(5)
             self.sock = sock
@@ -696,6 +698,7 @@ def load_env_config():
         'tak_ca_file': os.environ.get('TAK_CA_FILE', '').strip(),
         'tak_cert_file': os.environ.get('TAK_CERT_FILE', '').strip(),
         'tak_key_file': os.environ.get('TAK_KEY_FILE', '').strip(),
+        'tak_key_pass': os.environ.get('TAK_KEY_PASS', ''),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
         'tak_stale': int(os.environ.get('TAK_STALE', '300')),
         'tak_team': os.environ.get('TAK_TEAM', 'Cyan'),

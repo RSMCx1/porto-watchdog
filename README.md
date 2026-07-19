@@ -343,19 +343,47 @@ GPS fix -> pttbridge.apk -> porto-watchdog (local)
 
 The feature is **off by default** on both ends.
 
-**Server side** - point the remote watchdog at your TAK server:
+**Server side** - point the remote watchdog at your TAK server.
+Two options:
 
-1. On the TAK server, create a streaming input: web UI ->
-   **Configuration -> Input Manager -> Add Input**, protocol `tcp`,
-   port `8087`. Only the porto-watchdog container needs to reach this
-   port - do not expose it to the internet (use a shared Docker
-   network or firewall it to the docker host).
-2. Set `TAK_HOST` (and optionally the other `TAK_*` variables, see
-   table below) on the porto-watchdog container and restart it.
-3. Optional: friendly names on the map via
-   `TAK_CALLSIGNS: "radio01=Dad,radio02=Mom"`. Without it the marker
-   uses the radio's Mumla username (or radio_id if the mapping is a
-   wildcard).
+*Option A (recommended): certificate auth to the stock TLS input.*
+No new inputs needed - TAK's default 8089 input already requires a
+client certificate, which also stops anyone else on the network from
+reading the position feed or injecting fake markers.
+
+1. Issue a client certificate on the TAK server (uses the CA you
+   created during TAK setup):
+   ```bash
+   docker exec -it takserver bash -c \
+     "cd /opt/tak/certs && ./makeCert.sh client porto-bot"
+   ```
+2. Copy `certs/files/porto-bot.pem`, `porto-bot.key` and `ca.pem` to
+   the porto-watchdog host and mount them into the container
+   (e.g. `./takcerts:/app/takcerts:ro`).
+3. Set on the porto-watchdog container:
+   ```yaml
+   TAK_HOST: your-tak-server
+   TAK_PORT: "8089"
+   TAK_TLS: "true"
+   TAK_CA_FILE: /app/takcerts/ca.pem
+   TAK_CERT_FILE: /app/takcerts/porto-bot.pem
+   TAK_KEY_FILE: /app/takcerts/porto-bot.key
+   TAK_KEY_PASS: "atakatak"        # makeCert.sh default key password
+   ```
+   Client certs expire (makeCert.sh default ~2 years) - regenerate
+   and swap the files when they do.
+
+*Option B: plain streaming input (trusted networks only).* Create an
+input in the TAK web UI (**Configuration -> Input Manager -> Add
+Input**): protocol **STCP**, port `8087`, auth Anonymous, and set
+`TAK_HOST` + `TAK_PORT: "8087"` with `TAK_TLS: "false"`. Anyone who
+can reach that port can read the live position feed and inject
+markers - never expose it beyond a trusted LAN.
+
+Optional for both: friendly names on the map via
+`TAK_CALLSIGNS: "radio01=Dad,radio02=Mom"`. Without it the marker
+uses the radio's Mumla username (or radio_id if the mapping is a
+wildcard).
 
 **Radio side** - one-time, per radio:
 
@@ -437,6 +465,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `TAK_CA_FILE` | *(empty)* | CA cert for TLS (empty = no verification) |
 | `TAK_CERT_FILE` | *(empty)* | Client cert PEM for TLS client auth |
 | `TAK_KEY_FILE` | *(empty)* | Client key PEM for TLS client auth |
+| `TAK_KEY_PASS` | *(empty)* | Password for an encrypted client key |
 | `TAK_COT_TYPE` | a-f-G-U-C | CoT event type for radio markers |
 | `TAK_STALE` | 300 | Seconds until a marker goes stale in ATAK |
 | `TAK_TEAM` | Cyan | ATAK team color |

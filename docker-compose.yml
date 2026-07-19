@@ -51,12 +51,15 @@ services:
       # -- GPS -> TAK forwarding (optional, disabled unless TAK_HOST set) --
       # Radios with GPS enabled (see README) report positions which are
       # forwarded to a TAK server as Cursor-on-Target events.
+      # Recommended: certificate auth against TAK's stock TLS input (8089).
       # TAK_HOST: takserver              # TAK server hostname/IP
-      # TAK_PORT: "8087"                 # TAK streaming input port (TCP)
-      # TAK_TLS: "false"                 # true = TLS input (8089-style)
-      # TAK_CA_FILE: ""                  # CA cert (TLS; empty = no verify)
-      # TAK_CERT_FILE: ""                # client cert PEM (TLS with client auth)
-      # TAK_KEY_FILE: ""                 # client key PEM
+      # TAK_PORT: "8089"                 # 8089 = stock TLS input
+      # TAK_TLS: "true"                  # client-certificate auth (see README)
+      # TAK_CA_FILE: "/app/takcerts/ca.pem"
+      # TAK_CERT_FILE: "/app/takcerts/porto-bot.pem"
+      # TAK_KEY_FILE: "/app/takcerts/porto-bot.key"
+      # TAK_KEY_PASS: "atakatak"         # makeCert.sh default key password
+      # (plain alternative: STCP input on 8087, TAK_TLS "false" - LAN only)
       # TAK_COT_TYPE: "a-f-G-U-C"        # CoT event type
       # TAK_STALE: "300"                 # seconds until a marker goes stale
       # TAK_TEAM: "Cyan"                 # ATAK team color
@@ -74,6 +77,8 @@ services:
       # Persist bot certificate so it keeps the same identity across restarts
       # (required for Mumble ACL/registration)
       - porto-certs:/app/certs
+      # TAK client certificate for TLS auth (see GPS section in README)
+      # - ./takcerts:/app/takcerts:ro
     restart: unless-stopped
 
 volumes:

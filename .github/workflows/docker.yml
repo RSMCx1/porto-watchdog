@@ -11,6 +11,8 @@ on:
       - '*.jpg'
       - 'LICENSE'
       - '.gitignore'
+  # Manual rebuild of any ref (e.g. to restore :latest from main)
+  workflow_dispatch:
 
 permissions:
   contents: write

@@ -240,23 +240,34 @@ def thin_points(points, max_n):
     return thinned
 
 
-def build_channel_packet(radio_id, channel_name, secret):
+def _clip_utf8(text, limit):
+    """utf-8 encode and truncate without tearing a multi-byte char."""
+    raw = text.encode('utf-8')[:max(0, limit)]
+    while raw and (raw[-1] & 0xC0) == 0x80:
+        raw = raw[:-1]
+    if raw and raw[-1] >= 0xC0:
+        raw = raw[:-1]
+    return raw
+
+
+def build_channel_packet(radio_id, channel_name, secret, callsign=''):
     """Server->radio 'C' packet carrying the radio's current Mumble
-    channel name (empty = the radio's user is not on the server).
-    Signed and replay-windowed exactly like radio->server packets, so
-    nobody else can write to the radio's screen.
+    channel name (empty = the radio's user is not on the server) and,
+    space permitting, the radio's callsign as a second null-terminated
+    string (shown as "ID: <callsign>" on the radio's screen). Signed
+    and replay-windowed exactly like radio->server packets, so nobody
+    else can write to the radio's screen.
     """
     pkt = bytearray(CHANNEL_PKT_SIZE)
     pkt[0] = ord('C')
     rid = radio_id.encode('ascii', errors='replace')[:RADIO_ID_LEN]
     pkt[1:1 + len(rid)] = rid
     pkt[9:13] = struct.pack('>I', int(time.time()))
-    name = channel_name.encode('utf-8')[:CHANNEL_NAME_LEN]
-    # never end on a torn multi-byte sequence
-    while name and (name[-1] & 0xC0) == 0x80:
-        name = name[:-1]
-    if name and name[-1] >= 0xC0:
-        name = name[:-1]
+    name = _clip_utf8(channel_name, CHANNEL_NAME_LEN)
+    if callsign:
+        cs = _clip_utf8(callsign, CHANNEL_NAME_LEN - len(name) - 1)
+        if cs:
+            name = name + b'\x00' + cs
     pkt[13:13 + len(name)] = name
     pkt[45:CHANNEL_PKT_SIZE] = hmac.new(
         secret.encode('utf-8'), bytes(pkt[:45]), hashlib.sha256).digest()
@@ -1311,9 +1322,14 @@ class ChannelBot:
                     channel = self.mumble.channels.get(user['channel_id'])
                     if channel:
                         name = channel['name']
+        callsign = self.config.get('tak_callsigns', {}).get(radio_id, '')
+        if not callsign:
+            mapped = self.radio_map.get(radio_id, radio_id)
+            callsign = (mapped if not ('*' in mapped or '?' in mapped)
+                        else radio_id)
         try:
             self.udp_sock.sendto(
-                build_channel_packet(radio_id, name, secret), addr)
+                build_channel_packet(radio_id, name, secret, callsign), addr)
         except Exception as e:
             log.debug("channel update to %s failed: %s", radio_id, e)
 

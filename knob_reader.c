@@ -18,11 +18,14 @@
  *
  *   INBOUND (server → radio, same UDP socket):
  *     'C' channel packet (77 bytes): cmd(1) + radio_id(8) + ts(4) +
- *     channel name(32, utf-8 null-padded) + HMAC-SHA256(32) over
- *     bytes [0..44]. Verified (id + HMAC + 30s replay window) and
- *     written to /data/local/tmp/channel.txt, which the patched
- *     Te300k idle screen displays ("Channel: X" / "Disconnected").
- *     Empty name = our user is not connected to Mumble.
+ *     name field(32) + HMAC-SHA256(32) over bytes [0..44]. The name
+ *     field holds the channel name and, space permitting, the radio's
+ *     callsign as a second null-terminated string. Verified (id +
+ *     HMAC + 30s replay window) and written to
+ *     /data/local/tmp/channel.txt as two lines (channel, callsign),
+ *     which the patched Te300k idle screen displays ("Channel: X" /
+ *     "Disconnected" + "ID: <callsign>"). Empty channel = our user
+ *     is not connected to Mumble.
  *     /dev/input/event4  KEY_F13 (183) = Previous channel
  *     /dev/input/event4  KEY_F14 (184) = Next channel
  *     GPS fixes from pttbridge.apk (abstract socket "porto_loc")
@@ -812,13 +815,23 @@ static void handle_channel_packet(void) {
 
     memcpy(name, buf + 13, CHANNEL_NAME_LEN);
     name[CHANNEL_NAME_LEN] = '\0';
+    name[CHANNEL_NAME_LEN + 1] = '\0';
     fd = open(CHANNEL_FILE, O_WRONLY | O_TRUNC | O_CREAT, 0666);
     if (fd < 0) return;
-    len = strlen(name);
-    if (len > 0) {
-        name[len] = '\n';
-        w = write(fd, name, len + 1);
-        (void)w;
+    /* line 1: channel (may be empty = disconnected); line 2: callsign
+     * (second null-terminated string, if the server sent one) */
+    {
+        const char *callsign = "";
+        char out[2 * CHANNEL_NAME_LEN + 4];
+        int olen;
+        len = strlen(name);
+        if (len + 1 < CHANNEL_NAME_LEN)
+            callsign = name + len + 1;
+        olen = snprintf(out, sizeof(out), "%s\n%s\n", name, callsign);
+        if (olen > 0) {
+            w = write(fd, out, (size_t)olen);
+            (void)w;
+        }
     }
     close(fd);
 }

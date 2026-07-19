@@ -558,17 +558,21 @@ Notes:
 ## Channel Display on the Radio Screen (optional)
 
 The TE300K's idle screen normally shows the date and time. With this
-feature it shows what actually matters on a radio: `Channel: TAC 1` -
-or `Disconnected` when the server can't be reached or the radio's
-user isn't on Mumble.
+feature it shows what actually matters on a radio: `Channel: TAC 1`
+in the center - or `Disconnected` when the server can't be reached or
+the radio's user isn't on Mumble - plus the radio's identity
+(`ID: P1`, fed by the server from your callsign config) bottom-right,
+and the soft-key label bracketed as `[Settings]` so button
+indications are visually distinct from status text.
 
 How it works: the server replies to every packet a radio sends
 (including a minutely `'H'` heartbeat from the local watchdog) with a
 signed `'C'` packet carrying the radio's current channel name. The
 local watchdog verifies it (HMAC + replay window - nobody else can
-write to your screen) and stores it in
-`/data/local/tmp/channel.txt`. The idle screen polls that file every
-few seconds; stale (>150s) or empty means `Disconnected`.
+write to your screen) and stores it in `/data/local/tmp/channel.txt`
+(two lines: channel name, callsign). The idle screen polls that file
+every few seconds; a stale (>150s) or empty first line means
+`Disconnected`.
 
 The server and watchdog sides ship with this repo and are always on -
 the reply simply goes unused if you skip the screen part. Radio side,
@@ -584,15 +588,17 @@ one-time:
    [platform signing](#platform-signing-becoming-a-system-app) - so
    it can be decompiled with apktool, modified, re-signed with the
    same keys as `pttbridge.apk` (recipe in `pttbridge/README.md`),
-   and installed with `adb install -r`. Three small changes:
-   - `res/layout/activity_main.xml`: delete the `@string/ptt`
-     TextView (the stray "PTT" label) - optional cosmetics
+   and installed with `adb install -r`. The changes:
+   - `res/layout/activity_main.xml`: the `@string/ptt` TextView (the
+     stray "PTT" label) becomes an `ID:` TextView (new `porto_id`
+     resource id, registered in `values/ids.xml` + `public.xml`),
+     and the Settings label becomes the literal `[Settings]`
    - `MainActivity$2.smali`: the clock tick sleep `0xea60` (60s)
      becomes `0xbb8` (3s)
-   - `MainActivity$1.smali`: the clock case (`sswitch_0`) calls a
-     helper that reads `channel.txt` (fresh + non-empty ->
-     `Channel: <name>`, else `Disconnected`) instead of formatting
-     the date
+   - `MainActivity$1.smali`: the clock case (`sswitch_0`) calls
+     helpers that read `channel.txt` - line 1 into the center text
+     (fresh + non-empty -> `Channel: <name>`, else `Disconnected`),
+     line 2 into `ID: <callsign>`
 
    The patched APK is the vendor's firmware app, so it is not
    distributed in this repo. Rollback at any time with

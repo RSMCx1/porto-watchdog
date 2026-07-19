@@ -515,7 +515,7 @@ class TAKForwarder:
             '<detail>'
             '<contact callsign="{callsign}"/>'
             '<__group name="{team}" role="{role}"/>'
-            '<takv device="TE300K" platform="porto-watchdog" os="Android" version="1.1"/>'
+            '<takv device="TE300K" platform="porto-watchdog" os="Android" version="1.2"/>'
             '<track speed="{speed:.1f}" course="{course:.1f}"/>'
             '{remarks}'
             '</detail>'
@@ -958,11 +958,14 @@ class TAKForwarder:
             lat=fix['lat'], lon=fix['lon'], alt=fix['alt'],
             callsign=safe,
         )
+        # Tombstone first (clients that ignore cancels drop an already-
+        # stale alert), cancel LAST: the server's latest-SA cache replays
+        # the newest event per uid to every connecting client - even
+        # staled ones, which WebTAK renders - so the cached event must
+        # be the cancel, not the alert.
+        self._transmit(self._build_emergency(
+            uid, callsign, fix, stale_s=1).encode('utf-8'))
         if self._transmit(event.encode('utf-8')):
-            # tombstone: clients that ignore b-a-o-can drop the alert
-            # the moment its replacement is already stale
-            self._transmit(self._build_emergency(
-                uid, callsign, fix, stale_s=1).encode('utf-8'))
             self.active_emergency.pop(radio_id, None)
             self._save_state()
             log.warning("TAK: emergency alert cancelled for %s (%s)",

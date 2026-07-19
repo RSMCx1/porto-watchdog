@@ -17,6 +17,7 @@ import sys
 import os
 import hmac
 import hashlib
+import ssl
 import struct
 import time
 import signal
@@ -181,7 +182,6 @@ class TAKForwarder:
         try:
             sock = socket.create_connection((self.host, self.port), timeout=5)
             if self.use_tls:
-                import ssl
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 if self.ca_file:
                     ctx.load_verify_locations(self.ca_file)
@@ -234,12 +234,39 @@ class TAKForwarder:
             speed=fix['speed'], course=fix['course'],
         )
 
+    def _drain(self):
+        """Discard anything the TAK server sent us. Streaming inputs
+        (stcp/tls) echo the SA feed to connected clients; we never
+        consume it, so it must be drained or the receive buffer fills
+        and the server eventually drops us as a slow consumer.
+        Closes the socket if the server ended the connection.
+        """
+        if self.sock is None:
+            return
+        try:
+            self.sock.setblocking(False)
+            try:
+                while True:
+                    if not self.sock.recv(65536):
+                        raise ConnectionResetError("closed by TAK server")
+            except (BlockingIOError, ssl.SSLWantReadError):
+                pass
+            self.sock.settimeout(5)
+        except Exception as e:
+            log.debug("TAK: connection lost during drain: %s", e)
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
     def send(self, radio_id, callsign, fix):
         if not self.enabled:
             return
         event = self._build_event('porto-' + radio_id, callsign, fix)
         payload = event.encode('utf-8')
         for attempt in (1, 2):
+            self._drain()
             if self.sock is None and not self._connect():
                 return
             try:

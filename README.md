@@ -14,7 +14,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Speaker-mic (RSM) support** - plug in a remote speaker microphone and its PTT button works exactly like the body PTT button
 - **Channel knob** - turn the knob on the radio to switch between channels, just like a traditional two-way radio
 - **Voice announcements** - the radio speaks the channel name out loud every time you switch, so you always know where you are without looking at the screen
-- **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker
+- **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker; with TAK enabled, a 911 alert also pops up on every ATAK/WinTAK map at the radio's last known position
 - **Ident** - press the side button and your name is announced to the channel, useful for roll calls or check-ins
 - **Connect notification** - when a radio powers on and joins the server, it receives a spoken confirmation that it is connected and which channel it is in
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
@@ -487,6 +487,14 @@ Notes:
   radio reported, but not where it is. No extra keys to generate or
   distribute - it all derives from the `secret=` already in
   `knob.conf`.
+- **The emergency button reaches the TAK map too**: when a radio with
+  GPS triggers an emergency, the bot raises a 911 alert
+  (`b-a-o-tbl`) at the radio's last reported position - it alarms on
+  every connected ATAK/WinTAK client and clears itself after
+  `TAK_EMERGENCY_STALE` seconds (default 300). On by default whenever
+  TAK forwarding is on; set `TAK_EMERGENCY: "false"` to keep
+  emergencies Mumble-only. Radios that never sent a position are
+  skipped (no position to alert at).
 - First GPS fix after power-on can take a couple of minutes cold.
 
 ## Adding More Radios
@@ -548,6 +556,8 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `TAK_KEY_PASS` | *(empty)* | Password for an encrypted client key |
 | `TAK_COT_TYPE` | a-f-G-U-C | CoT event type for radio markers |
 | `TAK_STALE` | 300 | Seconds until a marker goes stale in ATAK |
+| `TAK_EMERGENCY` | true | Raise a TAK 911 alert when a radio triggers an emergency |
+| `TAK_EMERGENCY_STALE` | 300 | Seconds until an emergency alert clears in ATAK |
 | `TAK_TEAM` | Cyan | ATAK team color |
 | `TAK_ROLE` | Team Member | ATAK role shown on the marker |
 | `TAK_CALLSIGNS` | *(empty)* | Per-radio callsigns: `radio01=Dad,radio02=Mom` |

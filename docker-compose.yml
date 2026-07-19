@@ -66,6 +66,8 @@ services:
       # (plain alternative: STCP input on 8087, TAK_TLS "false" - LAN only)
       # TAK_COT_TYPE: "a-f-G-U-C"        # CoT event type
       # TAK_STALE: "300"                 # seconds until a marker goes stale
+      # TAK_EMERGENCY: "true"            # emergency button raises a TAK 911 alert
+      # TAK_EMERGENCY_STALE: "300"       # seconds until the alert self-clears
       # TAK_TEAM: "Cyan"                 # ATAK team color
       # TAK_ROLE: "Team Member"          # ATAK role
       # TAK_CALLSIGNS: "radio01=Dad"     # per-radio callsign override

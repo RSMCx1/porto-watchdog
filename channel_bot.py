@@ -197,6 +197,10 @@ class TAKForwarder:
         self.sock = None
         self.last_connect_attempt = 0
         self.seen_radios = set()
+        self.last_fix = {}         # radio_id -> last fix, for emergency events
+        self.last_callsign = {}
+        self.emergency = config.get('tak_emergency', True)
+        self.emergency_stale_s = config.get('tak_emergency_stale', 300)
 
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
         # (and renews) its own client certificate from the TAK server's
@@ -384,6 +388,35 @@ class TAKForwarder:
             speed=fix['speed'], course=fix['course'],
         )
 
+    def _build_emergency(self, uid, callsign, fix):
+        """ATAK 911-alert event: type b-a-o-tbl, uid <base>-9-1-1, linked
+        to the radio's own marker. Alarms on every connected TAK client
+        until it stales (emergency_stale_s).
+        """
+        now = time.time()
+        ce = fix['accuracy'] if fix['accuracy'] is not None else 9999999.0
+        callsign = (callsign.replace('&', '&amp;').replace('<', '&lt;')
+                    .replace('>', '&gt;').replace('"', '&quot;'))
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="{uid}-9-1-1" type="b-a-o-tbl" how="m-g"'
+            ' time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="{alt:.1f}"'
+            ' ce="{ce:.1f}" le="9999999.0"/>'
+            '<detail>'
+            '<emergency type="911 Alert">{callsign}-Alert</emergency>'
+            '<link uid="{uid}" type="{typ}" relation="p-p"/>'
+            '<contact callsign="{callsign}-Alert"/>'
+            '</detail>'
+            '</event>\n'
+        ).format(
+            uid=uid, typ=self.cot_type,
+            t=self._cot_time(now),
+            stale=self._cot_time(now + self.emergency_stale_s),
+            lat=fix['lat'], lon=fix['lon'], alt=fix['alt'], ce=ce,
+            callsign=callsign,
+        )
+
     def _drain(self):
         """Discard anything the TAK server sent us. Streaming inputs
         (stcp/tls) echo the SA feed to connected clients; we never
@@ -410,18 +443,14 @@ class TAKForwarder:
                 pass
             self.sock = None
 
-    def send(self, radio_id, callsign, fix):
-        if not self.enabled:
-            return
-        event = self._build_event('porto-' + radio_id, callsign, fix)
-        payload = event.encode('utf-8')
+    def _transmit(self, payload):
         for attempt in (1, 2):
             self._drain()
             if self.sock is None and not self._connect():
-                return
+                return False
             try:
                 self.sock.sendall(payload)
-                break
+                return True
             except Exception as e:
                 log.warning("TAK: send failed (attempt %d): %s", attempt, e)
                 try:
@@ -429,6 +458,15 @@ class TAKForwarder:
                 except Exception:
                     pass
                 self.sock = None
+        return False
+
+    def send(self, radio_id, callsign, fix):
+        if not self.enabled:
+            return
+        self.last_fix[radio_id] = fix
+        self.last_callsign[radio_id] = callsign
+        event = self._build_event('porto-' + radio_id, callsign, fix)
+        self._transmit(event.encode('utf-8'))
 
         if radio_id not in self.seen_radios:
             self.seen_radios.add(radio_id)
@@ -436,6 +474,24 @@ class TAKForwarder:
                      radio_id, callsign, fix['lat'], fix['lon'])
         else:
             log.debug("TAK: %s %.5f %.5f", radio_id, fix['lat'], fix['lon'])
+
+    def send_emergency(self, radio_id):
+        """Raise a 911 alert on the TAK map at the radio's last known
+        position. No-op when TAK or emergency forwarding is disabled,
+        or when the radio has never reported a position.
+        """
+        if not (self.enabled and self.emergency):
+            return
+        fix = self.last_fix.get(radio_id)
+        if fix is None:
+            log.info("TAK: no position known for %s - emergency not forwarded",
+                     radio_id)
+            return
+        callsign = self.last_callsign.get(radio_id, radio_id)
+        event = self._build_emergency('porto-' + radio_id, callsign, fix)
+        if self._transmit(event.encode('utf-8')):
+            log.warning("TAK: emergency alert raised for %s (%s)",
+                        radio_id, callsign)
 
     def close(self):
         if self.sock:
@@ -729,6 +785,7 @@ class ChannelBot:
             msg = fmt.format(username=actual_name)
             log.warning("[%s] EMERGENCY triggered", radio_id)
             self.broadcast_to_channel(radio_id, msg)
+            self.tak.send_emergency(radio_id)
         elif cmd == 'I':
             fmt = self.config['ident_format']
             username = self.radio_map.get(radio_id, radio_id)
@@ -777,6 +834,8 @@ class ChannelBot:
             if self.tak.enroll_user:
                 log.info("TAK enrollment: user '%s' via port %d (auto-renews)",
                          self.tak.enroll_user, self.tak.enroll_port)
+            if not self.tak.emergency:
+                log.info("TAK emergency alerts: disabled (TAK_EMERGENCY=false)")
         else:
             log.info("TAK forwarding: disabled (set TAK_HOST to enable)")
 
@@ -861,6 +920,8 @@ def load_env_config():
         'tak_cert_file': os.environ.get('TAK_CERT_FILE', '').strip(),
         'tak_key_file': os.environ.get('TAK_KEY_FILE', '').strip(),
         'tak_key_pass': os.environ.get('TAK_KEY_PASS', ''),
+        'tak_emergency': env_bool('TAK_EMERGENCY', 'true'),
+        'tak_emergency_stale': int(os.environ.get('TAK_EMERGENCY_STALE', '300')),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
         'tak_stale': int(os.environ.get('TAK_STALE', '300')),
         'tak_team': os.environ.get('TAK_TEAM', 'Cyan'),

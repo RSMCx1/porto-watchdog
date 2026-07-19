@@ -11,6 +11,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 ## Features
 
 - **Push-to-talk** - press the physical PTT button on the radio and your voice goes out instantly, even with the app running in the background. No screen interaction needed
+- **Speaker-mic (RSM) support** - plug in a remote speaker microphone and its PTT button works exactly like the body PTT button
 - **Channel knob** - turn the knob on the radio to switch between channels, just like a traditional two-way radio
 - **Voice announcements** - the radio speaks the channel name out loud every time you switch, so you always know where you are without looking at the screen
 - **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker
@@ -18,7 +19,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Connect notification** - when a radio powers on and joins the server, it receives a spoken confirmation that it is connected and which channel it is in
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
 - **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
-- **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default
+- **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default, coordinates encrypted in transit - and the bot can enroll its own TAK certificate, so there are no certificate files to manage
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
@@ -29,21 +30,26 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 Two watchdogs work together:
 
 - **Local watchdog** (`porto-watchdog` binary) - runs in the background on
-  each radio, intercepts hardware key events, handles PTT locally and
-  forwards knob/button presses to the remote watchdog over UDP.
+  each radio, intercepts hardware key events, handles PTT locally (body
+  button and RSM speaker-mic alike) and forwards knob/button presses -
+  and, when GPS is enabled, encrypted position reports - to the remote
+  watchdog over UDP.
 - **Remote watchdog** (`porto-watchdog` Docker container) - runs on your
-  server, receives key events from all radios, switches channels, and
-  broadcasts emergency/ident messages through the Mumble server.
+  server, receives key events from all radios, switches channels,
+  broadcasts emergency/ident messages through the Mumble server, and
+  optionally forwards radio positions to a TAK server.
 
 ### Button Mapping
 
 | Input | Key | What happens |
 |-------|-----|--------------|
 | **PTT button** | F1 | Hold to talk, release to stop (handled locally via Mumla) |
+| **RSM PTT** (speaker-mic) | F1 | Same as body PTT - hold to talk from the external speaker-mic |
 | **Knob clockwise** | F14 | Next channel - forwarded to remote watchdog, TTS announces |
 | **Knob counter-clockwise** | F13 | Previous channel - forwarded to remote watchdog |
 | **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name |
 | **Emergency button** | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
+| **GPS** (optional) | - | Position reports - encrypted, forwarded to the TAK server if configured |
 
 ### Architecture
 
@@ -51,27 +57,29 @@ Two watchdogs work together:
   TE300K Radio (runs in background after boot)
   ┌────────────────────────────────────────────────┐
   │                                                │
-  │      PTT (F1)   Ident (F2)   Emergency (F3)    │
+  │ PTT (F1) RSM PTT (F1) Ident (F2) Emergency (F3)│
   │        Knob CW (F14)     Knob CCW (F13)        │
   │       │         │         │                    │
   │  ┌────┴─────────┴─────────┴─────────────────┐  │
   │  │    porto-watchdog (local watchdog)       │  │
   │  │    background daemon on the radio        │  │
   │  │                                          │  │
-  │  │    Intercepts /dev/input/event3 + event4 │  │
+  │  │    Intercepts /dev/input/event2 + 3 + 4  │  │
   │  │    Routes each keypress:                 │  │
-  │  │      F1  → local PTT socket              │  │
+  │  │      F1  → local PTT socket (body + RSM) │  │
   │  │      F2  → remote watchdog (UDP)         │  │
   │  │      F3  → remote watchdog (UDP)         │  │
   │  │      F13 → remote watchdog (UDP)         │  │
   │  │      F14 → remote watchdog (UDP)         │  │
-  │  └──┬──────────────────────────┬────────────┘  │
-  │     │ PTT socket               │ UDP :4378     │
-  │  ┌──┴──────────────┐           │               │
-  │  │ pttbridge.apk   │           │               │
-  │  │ boot autostart  │           │               │
-  │  │ PTT → Mumla     │           │               │
-  │  └──┬──────────────┘           │               │
+  │  │    Encrypts GPS fixes → 'L' packet (UDP) │  │
+  │  └──┬────────────────▲─────────┬────────────┘  │
+  │     │ PTT socket     │ GPS     │ UDP :4378     │
+  │  ┌──┴────────────────┴────┐    │               │
+  │  │ pttbridge.apk          │    │               │
+  │  │ boot autostart         │    │               │
+  │  │ PTT → Mumla            │    │               │
+  │  │ GPS → socket porto_loc │    │               │
+  │  └──┬─────────────────────┘    │               │
   │  ┌──┴──────────────┐           │               │
   │  │     Mumla       │           │               │
   │  └──────┬──────────┘           │               │
@@ -86,15 +94,25 @@ Two watchdogs work together:
   │  │                │←─│ (remote watchdog)  │  │
   │  │                │  │ moves users        │  │
   │  │                │  │ broadcasts alerts  │  │
-  │  └────────────────┘  └────────────────────┘  │
+  │  │                │  │ decrypts positions │  │
+  │  └────────────────┘  └─────────┬──────────┘  │
+  │                                │ CoT XML     │
+  │                                ▼ over TLS    │
+  │                      ┌─────────┬──────────┐  │
+  │                      │ TAK server         │  │
+  │                      │ (optional) → ATAK  │  │
+  │                      └────────────────────┘  │
   └──────────────────────────────────────────────┘
 ```
 
 The local watchdog runs as a background daemon - it starts on boot,
 reads hardware input events continuously, and never needs user
-interaction. PTT is handled entirely on the radio (low latency).
+interaction. PTT is handled entirely on the radio (low latency),
+whether it comes from the body button or an attached speaker-mic.
 Channel switching and alerts are forwarded as signed UDP packets to
-the remote watchdog, which executes them on the Mumble server.
+the remote watchdog, which executes them on the Mumble server. GPS
+fixes, when enabled, ride the same UDP channel as encrypted 'L'
+packets and end up as live markers on the TAK map.
 
 ### The Mumble bot
 
@@ -113,10 +131,18 @@ a single compromised radio without touching the others. Unsigned,
 expired, or unknown packets are silently dropped - nothing gets
 through without a valid signature.
 
+Position reports get one extra step: the coordinate block is
+decrypted (each radio's keystream derives from its existing secret),
+turned into a Cursor-on-Target event, and streamed to the TAK server
+over a persistent TLS connection - see
+[GPS Tracking](#gps-tracking-tak-integration).
+
 The bot auto-generates a TLS client certificate on first start and
-stores it in a Docker volume. This gives it a persistent identity on
-the Mumble server, so ACL permissions (like the ability to move users)
-survive container restarts. All configuration is done through
+stores it in a Docker volume (`CERT_DIR`, default `/app/certs`). This
+gives it a persistent identity on the Mumble server, so ACL
+permissions (like the ability to move users) survive container
+restarts. The same volume holds the TAK client certificate when
+self-enrollment is used. All configuration is done through
 environment variables - no config files to manage.
 
 ## Making It Work - The Hard Parts
@@ -205,6 +231,8 @@ environment:
 ```
 
 All other variables have sensible defaults (see full list below).
+GPS position reporting to a TAK server is optional and can be added
+at any time - see [GPS Tracking](#gps-tracking-tak-integration).
 
 **1c. Register the bot and grant permissions**
 
@@ -261,6 +289,7 @@ radio_id=radio01           # unique per radio (max 8 chars)
 secret=your-secret-here    # same secret as Step 1a
 device=/dev/input/event4   # knob input (don't change)
 button_device=/dev/input/event3  # button input (don't change)
+ptt_device=/dev/input/event2     # RSM speaker-mic PTT (don't change)
 ```
 
 Each radio needs a **unique `radio_id`**. The `secret` must match what
@@ -319,6 +348,7 @@ Reboot the radio. On boot, `pttbridge.apk` automatically:
 Test everything:
 - **Knob** - turn it, you should hear the channel name announced
 - **PTT** - hold the button, your voice should transmit
+- **RSM PTT** - plug in a speaker-mic, hold its button - same as body PTT
 - **Side button (F2)** - your name gets announced to the channel
 - **Emergency (F3)** - "alert alert" broadcasts to the channel
 
@@ -337,11 +367,16 @@ How it flows:
 
 ```
 GPS fix -> pttbridge.apk -> porto-watchdog (local)
-        -> signed UDP 'L' packet -> porto-watchdog (remote)
-        -> CoT XML over TCP -> TAK server -> ATAK map
+        -> encrypted+signed UDP 'L' packet -> porto-watchdog (remote)
+        -> CoT XML over TLS -> TAK server -> ATAK map
 ```
 
 The feature is **off by default** on both ends.
+
+Only the radio -> server hop ever crosses the internet, and it rides
+the same signed, encrypted UDP channel as the knob and buttons. The
+server -> TAK hop is server-to-server, no matter where the radios
+roam.
 
 **Server side** - point the remote watchdog at your TAK server.
 Three options:
@@ -404,7 +439,7 @@ Input**): protocol **STCP**, port `8087`, auth Anonymous, and set
 can reach that port can read the live position feed and inject
 markers - never expose it beyond a trusted LAN.
 
-Optional for both: friendly names on the map via
+Optional for all three: friendly names on the map via
 `TAK_CALLSIGNS: "radio01=Dad,radio02=Mom"`. Without it the marker
 uses the radio's Mumla username (or radio_id if the mapping is a
 wildcard).
@@ -427,9 +462,10 @@ Reboot the radio. About 20 seconds after boot, `pttbridge.apk` reads
 each fix is forwarded as a signed `'L'` packet. The local watchdog
 additionally rate-limits reports to one per 5 seconds.
 
-The same five commands upgrade a radio that was onboarded before GPS
-support existed - `adb install -r` updates the app in place and
-nothing else changes.
+For a radio onboarded before GPS support existed, update the app
+first - `adb install -r pttbridge.apk` upgrades it in place (granted
+permissions and boot-start behavior survive upgrades) - then run the
+same three commands above and reboot. Nothing else changes.
 
 No TAK configuration ever touches the radio: position reports travel
 over the same UDP channel (and port) as the knob and buttons, so any
@@ -499,6 +535,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `CONNECT_MESSAGE_FORMAT` | {username} {channel} connected | Connect message template |
 | `LOG_LEVEL` | INFO | DEBUG, INFO, WARNING, ERROR |
 | `RADIOS` | *(required)* | Radio-to-user mapping |
+| `CERT_DIR` | /app/certs | Certificate storage (bot's Mumble identity + enrolled TAK certs) |
 | `TAK_HOST` | *(empty=disabled)* | TAK server hostname/IP for GPS forwarding |
 | `TAK_PORT` | 8087 / 8089 with TLS | TAK streaming input port |
 | `TAK_TLS` | false | Use TLS for the TAK connection (implied by enrollment) |
@@ -527,6 +564,7 @@ All key events forwarded to the remote watchdog are authenticated.
 | Replay protection | Packets expire after 30 seconds |
 | IP allowlist | Optional `ALLOWED_IPS` env var |
 | Per-radio identity | 8-char radio ID in every packet |
+| TAK link | TLS with client-certificate auth (self-enrolled or manual) on the server-to-server hop |
 
 Unsigned or expired packets are silently dropped.
 
@@ -564,7 +602,9 @@ the [latest release](../../releases/latest) or the
 - **Auto-start not working after reboot** - check logcat: `adb shell logcat -d | grep -i pttbridge`. Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog` and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
 - **DNS not resolving on the radio** - check logcat: `adb shell logcat -d | grep porto-watchdog`. If you see "DNS not ready", the radio's WiFi may not be connected yet. The binary retries DNS on every keypress. You can also use an IP address directly in `knob.conf` to bypass DNS entirely
 - **No TTS** - enable Text-to-Speech in Mumla settings on the radio
-- **No GPS markers in ATAK** - check the chain step by step: `adb shell logcat -d | grep porto-watchdog` should show `LOC <lat> <lon>` lines when fixes flow. No lines? Check `loc.conf` exists, the location permission is granted (`adb shell dumpsys package com.pttbridge | grep ACCESS_FINE`), and GPS is enabled (`adb shell settings get secure location_providers_allowed`). Lines but no markers? Check the remote watchdog logs (`docker logs porto-watchdog`) for `TAK: connected` / `TAK: first position`, and that the TAK input on port 8087 exists and is reachable from the container
+- **No GPS markers in ATAK** - check the chain step by step: `adb shell logcat -d | grep porto-watchdog` should show `LOC <lat> <lon>` lines when fixes flow. No lines? Check `loc.conf` exists, the location permission is granted (`adb shell dumpsys package com.pttbridge | grep ACCESS_FINE`), and GPS is enabled (`adb shell settings get secure location_providers_allowed`). Lines but no markers? Check the remote watchdog logs (`docker logs porto-watchdog`) for `TAK: connected` / `TAK: first position`, and that the TAK input you chose (stock TLS 8089, or STCP 8087) is reachable from the container
+- **`TAK: enrollment failed` in the logs** - the enrollment user must exist on the TAK server and `TAK_ENROLL_PASS` must match. Remember TAK's password complexity rule (15+ chars, upper/lower/digit/special) when creating the user. Also check the container can reach the enrollment port: `TAK_ENROLL_PORT` (default 8446) is separate from the streaming input port
+- **RSM PTT not working** - the daemon logs `rsm_ptt=/dev/input/event2` at startup (`adb shell logcat -d | grep porto-watchdog`). If it says `RSM PTT not available`, check the `ptt_device` line in `knob.conf`
 - **Radio has no GPS fix indoors** - normal; cold start can take minutes and needs sky view. Test near a window or outside
 
 ## Roadmap

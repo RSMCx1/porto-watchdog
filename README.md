@@ -535,8 +535,11 @@ Notes:
   WinTAK and WebTAK; by radio id, callsign or username,
   case-insensitive) and the bot draws the line and confirms in chat.
   It appears on every client as "P1 2026-07-18..2026-07-22" and
-  auto-expires after an hour. The same is available from the server
-  CLI:
+  auto-expires after an hour. The bot shows up in your contacts as
+  `porto-watchdog` (TAK only delivers chat to announced contacts) -
+  set `TAK_BOT_POSITION: "lat,lon"` to pin its marker at your
+  server's location instead of 0,0. The same is available from the
+  server CLI:
   ```bash
   docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-20
   docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-18 2026-07-22 --trail-ttl 120
@@ -659,6 +662,7 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `TAK_LAST_KNOWN` | true | Keep silent radios on the map at their last known position |
 | `TAK_TRAIL` | true | Draw a rolling trail line per radio on the map |
 | `TAK_TRAIL_HOURS` | 6 | Hours of track shown in the rolling trail |
+| `TAK_BOT_POSITION` | *(empty = 0,0)* | "lat,lon" for the bot's own map marker (it must announce presence to receive chat commands) |
 | `TRACK_HISTORY` | true | Log every position to a per-radio history file |
 | `TRACK_DIR` | /app/certs/tracks | Where position history is stored |
 | `TAK_TEAM` | Cyan | ATAK team color |

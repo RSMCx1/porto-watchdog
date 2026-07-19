@@ -281,6 +281,14 @@ class TAKForwarder:
         self._rx = b''
         self._seen_chat = set()
         self._processing = False
+        self._last_presence = 0
+        self.bot_lat, self.bot_lon = 0.0, 0.0
+        pos = str(config.get('tak_bot_position', '')).strip()
+        if pos:
+            try:
+                self.bot_lat, self.bot_lon = (float(v) for v in pos.split(','))
+            except ValueError:
+                log.warning("TAK_BOT_POSITION must be 'lat,lon' - got %r", pos)
         self._load_state()
 
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
@@ -588,6 +596,34 @@ class TAKForwarder:
     CHAT_TRAIL_TTL_S = 3600
     BOT_UID = 'porto-watchdog-bot'
     BOT_CALLSIGN = 'porto-watchdog'
+    PRESENCE_S = 60
+
+    def _send_presence(self):
+        """Announce the bot as a chat-capable contact. TAK only routes
+        GeoChat to clients that have published a presence with an
+        endpoint - without this, chat commands never reach us
+        (empirically verified). Position defaults to 0,0; set
+        TAK_BOT_POSITION="lat,lon" to pin the marker at your server.
+        """
+        now = time.time()
+        event = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g"'
+            ' time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="0.0"'
+            ' ce="9999999.0" le="9999999.0"/>'
+            '<detail>'
+            '<contact callsign="{cs}" endpoint="*:-1:stcp"/>'
+            '<__group name="{team}" role="Team Member"/>'
+            '<takv device="server" platform="porto-watchdog" os="linux"'
+            ' version="1.2"/>'
+            '</detail>'
+            '</event>\n'
+        ).format(uid=self.BOT_UID, cs=self.BOT_CALLSIGN,
+                 t=self._cot_time(now),
+                 stale=self._cot_time(now + self.PRESENCE_S * 5),
+                 lat=self.bot_lat, lon=self.bot_lon, team=self.team)
+        self._transmit(event.encode('utf-8'))
 
     def _process_inbound(self):
         """Scan the (previously discarded) SA feed for GeoChat commands
@@ -845,6 +881,9 @@ class TAKForwarder:
         if not self.enabled:
             return
         now = time.time()
+        if now - self._last_presence >= self.PRESENCE_S:
+            self._last_presence = now
+            self._send_presence()
         if (self.trail and self.track_dir
                 and now - self._last_trail_publish >= self.TRAIL_REFRESH_S):
             self._last_trail_publish = now
@@ -1424,6 +1463,7 @@ def load_env_config():
         'tak_last_known': env_bool('TAK_LAST_KNOWN', 'true'),
         'tak_trail': env_bool('TAK_TRAIL', 'true'),
         'tak_trail_hours': float(os.environ.get('TAK_TRAIL_HOURS', '6')),
+        'tak_bot_position': os.environ.get('TAK_BOT_POSITION', '').strip(),
         'track_dir': (os.environ.get('TRACK_DIR', '/app/certs/tracks')
                       if env_bool('TRACK_HISTORY', 'true') else ''),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),

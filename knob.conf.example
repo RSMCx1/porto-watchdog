@@ -24,3 +24,9 @@ button_device=/dev/input/event3
 # Input device - RSM PTT (telo_ptt, external speaker-mic)
 # Remove or leave empty to disable RSM PTT
 ptt_device=/dev/input/event2
+
+# --- GPS position reporting (optional) ---
+# GPS is NOT configured here. It is enabled per radio by creating
+# /data/local/tmp/loc.conf containing the update interval in seconds:
+#   adb shell "echo 30 > /data/local/tmp/loc.conf"
+# Delete the file to disable. See "GPS tracking" in the README.

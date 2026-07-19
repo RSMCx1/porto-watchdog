@@ -2,7 +2,7 @@ name: Build and Push
 
 on:
   push:
-    branches: [main]
+    branches: [main, gps-tak-tracking]  # TODO: revert to main only before merge
     tags: ['v*']
     paths-ignore:
       - '*.md'

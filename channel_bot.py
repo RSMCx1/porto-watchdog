@@ -50,10 +50,19 @@ PAYLOAD_LEN = 13   # cmd(1) + radio_id(8) + timestamp(4)
 HMAC_OFFSET = 13
 HMAC_LEN = 32
 
+# Location packet ('L'): payload adds lat(4) lon(4) alt(2) speed(2)
+# course(2) accuracy(1) after the timestamp
+LOC_PKT_SIZE = 60
+LOC_PAYLOAD_LEN = 28
+
 # Replay window: reject packets older than this (seconds)
 REPLAY_WINDOW = 30
 
-VALID_COMMANDS = ('N', 'P', 'E', 'I')
+VALID_COMMANDS = ('N', 'P', 'E', 'I', 'L')
+
+# Commands subject to the per-radio debounce (key presses; position
+# reports must never be debounced against them or vice versa)
+KEY_COMMANDS = ('N', 'P', 'E', 'I')
 
 
 # ============================================================================
@@ -74,7 +83,11 @@ def verify_packet(data, config):
     """Verify and parse a signed packet.
     Returns (command, radio_id) or (None, None) on failure.
     """
-    if len(data) != PKT_SIZE:
+    if len(data) == PKT_SIZE:
+        payload_len = PAYLOAD_LEN
+    elif len(data) == LOC_PKT_SIZE and data[0:1] == b'L':
+        payload_len = LOC_PAYLOAD_LEN
+    else:
         log.debug("Bad packet size: %d", len(data))
         return None, None
 
@@ -86,8 +99,8 @@ def verify_packet(data, config):
         log.warning("No secret configured for radio '%s'", radio_id)
         return None, None
 
-    payload = data[:PAYLOAD_LEN]
-    received_hmac = data[HMAC_OFFSET:HMAC_OFFSET + HMAC_LEN]
+    payload = data[:payload_len]
+    received_hmac = data[payload_len:payload_len + HMAC_LEN]
 
     expected_hmac = hmac.new(
         secret.encode('utf-8'),
@@ -113,6 +126,147 @@ def verify_packet(data, config):
         return None, None
 
     return cmd, radio_id
+
+
+def parse_loc_packet(data):
+    """Parse the position fields of a verified 60-byte 'L' packet.
+    Returns dict with lat/lon (deg), alt (m), speed (m/s), course (deg),
+    accuracy (m, None if unknown).
+    """
+    lat, lon, alt, speed, course, acc = struct.unpack('>iihHHB', data[13:28])
+    return {
+        'lat': lat / 1e7,
+        'lon': lon / 1e7,
+        'alt': alt,
+        'speed': speed / 10.0,
+        'course': course / 10.0,
+        'accuracy': None if acc >= 255 else acc,
+    }
+
+
+# ============================================================================
+# TAK forwarder - translates position reports to Cursor-on-Target
+# ============================================================================
+class TAKForwarder:
+    """Maintains a streaming connection to a TAK server input and sends
+    one CoT <event> per position report. Disabled unless TAK_HOST is set.
+    """
+
+    RECONNECT_MIN_S = 5
+
+    def __init__(self, config):
+        self.host = config['tak_host']
+        self.port = config['tak_port']
+        self.use_tls = config['tak_tls']
+        self.ca_file = config['tak_ca_file']
+        self.cert_file = config['tak_cert_file']
+        self.key_file = config['tak_key_file']
+        self.cot_type = config['tak_cot_type']
+        self.stale_s = config['tak_stale']
+        self.team = config['tak_team']
+        self.role = config['tak_role']
+        self.sock = None
+        self.last_connect_attempt = 0
+        self.seen_radios = set()
+
+    @property
+    def enabled(self):
+        return bool(self.host)
+
+    def _connect(self):
+        now = time.time()
+        if now - self.last_connect_attempt < self.RECONNECT_MIN_S:
+            return False
+        self.last_connect_attempt = now
+        try:
+            sock = socket.create_connection((self.host, self.port), timeout=5)
+            if self.use_tls:
+                import ssl
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                if self.ca_file:
+                    ctx.load_verify_locations(self.ca_file)
+                    ctx.check_hostname = False
+                else:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                if self.cert_file:
+                    ctx.load_cert_chain(self.cert_file, self.key_file or None)
+                sock = ctx.wrap_socket(sock, server_hostname=self.host)
+            sock.settimeout(5)
+            self.sock = sock
+            log.info("TAK: connected to %s:%d%s", self.host, self.port,
+                     " (TLS)" if self.use_tls else "")
+            return True
+        except Exception as e:
+            log.warning("TAK: connect to %s:%d failed: %s",
+                        self.host, self.port, e)
+            self.sock = None
+            return False
+
+    @staticmethod
+    def _cot_time(t):
+        return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t)) + '.000Z'
+
+    def _build_event(self, uid, callsign, fix):
+        now = time.time()
+        ce = fix['accuracy'] if fix['accuracy'] is not None else 9999999.0
+        callsign = (callsign.replace('&', '&amp;').replace('<', '&lt;')
+                    .replace('>', '&gt;').replace('"', '&quot;'))
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="{uid}" type="{typ}" how="m-g"'
+            ' time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="{alt:.1f}"'
+            ' ce="{ce:.1f}" le="9999999.0"/>'
+            '<detail>'
+            '<contact callsign="{callsign}"/>'
+            '<__group name="{team}" role="{role}"/>'
+            '<takv device="TE300K" platform="porto-watchdog" os="Android" version="1.1"/>'
+            '<track speed="{speed:.1f}" course="{course:.1f}"/>'
+            '</detail>'
+            '</event>\n'
+        ).format(
+            uid=uid, typ=self.cot_type,
+            t=self._cot_time(now),
+            stale=self._cot_time(now + self.stale_s),
+            lat=fix['lat'], lon=fix['lon'], alt=fix['alt'], ce=ce,
+            callsign=callsign, team=self.team, role=self.role,
+            speed=fix['speed'], course=fix['course'],
+        )
+
+    def send(self, radio_id, callsign, fix):
+        if not self.enabled:
+            return
+        event = self._build_event('porto-' + radio_id, callsign, fix)
+        payload = event.encode('utf-8')
+        for attempt in (1, 2):
+            if self.sock is None and not self._connect():
+                return
+            try:
+                self.sock.sendall(payload)
+                break
+            except Exception as e:
+                log.warning("TAK: send failed (attempt %d): %s", attempt, e)
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+
+        if radio_id not in self.seen_radios:
+            self.seen_radios.add(radio_id)
+            log.info("TAK: first position from %s (%s): %.5f %.5f",
+                     radio_id, callsign, fix['lat'], fix['lon'])
+        else:
+            log.debug("TAK: %s %.5f %.5f", radio_id, fix['lat'], fix['lon'])
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
 
 # ============================================================================
@@ -235,6 +389,8 @@ class ChannelBot:
             self.allowed_ips = set(
                 ip.strip() for ip in config['allowed_ips'].split(',')
             )
+
+        self.tak = TAKForwarder(config)
 
     def ensure_certificate(self):
         """Generate a persistent certificate so the bot can be registered."""
@@ -363,14 +519,26 @@ class ChannelBot:
         if cmd is None:
             return
 
-        # Per-radio debounce
-        now = time.time() * 1000
-        last = self.last_switch.get(radio_id, 0)
-        if now - last < self.debounce_ms:
-            return
-        self.last_switch[radio_id] = now
+        # Per-radio debounce - key presses only; 'L' position reports
+        # arrive on their own schedule and must not consume the window
+        if cmd in KEY_COMMANDS:
+            now = time.time() * 1000
+            last = self.last_switch.get(radio_id, 0)
+            if now - last < self.debounce_ms:
+                return
+            self.last_switch[radio_id] = now
 
-        if cmd in ('N', 'P'):
+        if cmd == 'L':
+            if radio_id not in self.radio_map:
+                log.warning("loc: unknown radio_id '%s'", radio_id)
+                return
+            fix = parse_loc_packet(data)
+            callsign = self.config['tak_callsigns'].get(radio_id)
+            if not callsign:
+                mapped = self.radio_map[radio_id]
+                callsign = mapped if not ('*' in mapped or '?' in mapped) else radio_id
+            self.tak.send(radio_id, callsign, fix)
+        elif cmd in ('N', 'P'):
             direction = 'next' if cmd == 'N' else 'prev'
             name, cid = self.channel_mgr.switch(radio_id, direction)
             if name:
@@ -423,6 +591,14 @@ class ChannelBot:
         else:
             log.info("Accepting from any IP (use ALLOWED_IPS to restrict)")
 
+        if self.tak.enabled:
+            log.info("TAK forwarding: %s:%d (%s, type=%s, stale=%ds)",
+                     self.tak.host, self.tak.port,
+                     "TLS" if self.tak.use_tls else "TCP",
+                     self.tak.cot_type, self.tak.stale_s)
+        else:
+            log.info("TAK forwarding: disabled (set TAK_HOST to enable)")
+
         # UDP listener
         listen_addr = self.config['udp_addr']
         listen_port = self.config['udp_port']
@@ -447,6 +623,7 @@ class ChannelBot:
             pass
         finally:
             sock.close()
+            self.tak.close()
             if self.mumble:
                 self.mumble.stop()
             log.info("Stopped.")
@@ -485,7 +662,29 @@ def load_env_config():
         'connect_message_format': os.environ.get(
             'CONNECT_MESSAGE_FORMAT', '{username} {channel} connected'),
         'cert_dir': os.environ.get('CERT_DIR', '/app/certs'),
+        # -- TAK forwarding (disabled unless TAK_HOST is set) --
+        'tak_host': os.environ.get('TAK_HOST', '').strip(),
+        'tak_port': int(os.environ.get('TAK_PORT', '8087')),
+        'tak_tls': env_bool('TAK_TLS', 'false'),
+        'tak_ca_file': os.environ.get('TAK_CA_FILE', '').strip(),
+        'tak_cert_file': os.environ.get('TAK_CERT_FILE', '').strip(),
+        'tak_key_file': os.environ.get('TAK_KEY_FILE', '').strip(),
+        'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
+        'tak_stale': int(os.environ.get('TAK_STALE', '300')),
+        'tak_team': os.environ.get('TAK_TEAM', 'Cyan'),
+        'tak_role': os.environ.get('TAK_ROLE', 'Team Member'),
     }
+
+    # Parse TAK_CALLSIGNS: "radio01=Dad,radio02=Mom" (falls back to the
+    # RADIOS username, then to the radio_id, when not listed here)
+    config['tak_callsigns'] = {}
+    callsigns_str = os.environ.get('TAK_CALLSIGNS', '')
+    if callsigns_str.strip():
+        for pair in callsigns_str.split(','):
+            pair = pair.strip()
+            if '=' in pair:
+                radio_id, callsign = pair.split('=', 1)
+                config['tak_callsigns'][radio_id.strip()] = callsign.strip()
 
     # Parse CHANNELS_SKIP: "Lobby,AFK,Admin" (comma-separated channel names to exclude)
     config['channels_skip'] = set()

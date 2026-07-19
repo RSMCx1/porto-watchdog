@@ -13,16 +13,34 @@
  *     /dev/input/event3  KEY_F3 (61)  = Emergency broadcast
  *     /dev/input/event4  KEY_F13 (183) = Previous channel
  *     /dev/input/event4  KEY_F14 (184) = Next channel
+ *     GPS fixes from pttbridge.apk (abstract socket "porto_loc")
+ *       = position report ('L' packet, forwarded to TAK by the server)
  *
  * The binary is launched on boot by pttbridge.apk and stays resident.
  * If /data/local/tmp/knob.conf exists, remote watchdog features are
  * enabled. Otherwise it runs in PTT-only mode.
  *
- * Packet format (45 bytes, HMAC-SHA256 signed):
+ * GPS reporting is opt-in per radio: it only activates when
+ * /data/local/tmp/loc.conf exists (single integer: interval in
+ * seconds, read by pttbridge.apk, which owns the GPS receiver).
+ *
+ * Key packet format (45 bytes, HMAC-SHA256 signed):
  *   [0]      command: 'N'/'P'/'E'/'I'
  *   [1..8]   radio_id: 8-char identifier (null-padded)
  *   [9..12]  timestamp: uint32 big-endian (unix epoch)
  *   [13..44] HMAC-SHA256 over bytes [0..12]
+ *
+ * Location packet format (60 bytes, HMAC-SHA256 signed):
+ *   [0]      command: 'L'
+ *   [1..8]   radio_id: 8-char identifier (null-padded)
+ *   [9..12]  timestamp: uint32 big-endian (unix epoch)
+ *   [13..16] latitude:  int32 big-endian, degrees * 1e7
+ *   [17..20] longitude: int32 big-endian, degrees * 1e7
+ *   [21..22] altitude:  int16 big-endian, meters
+ *   [23..24] speed:     uint16 big-endian, 0.1 m/s units
+ *   [25..26] course:    uint16 big-endian, 0.1 degree units
+ *   [27]     accuracy:  uint8, meters (255 = worse/unknown)
+ *   [28..59] HMAC-SHA256 over bytes [0..27]
  *
  * Build: arm-linux-gnueabihf-gcc -static -o porto-watchdog knob_reader.c
  *
@@ -31,6 +49,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -170,16 +189,30 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 #define HMAC_OFFSET     13
 #define PAYLOAD_LEN     13
 
+/* Location packet constants */
+#define LOC_PKT_SIZE    60
+#define LOC_PAYLOAD_LEN 28
+
 /* Command bytes (UDP) */
 #define CMD_NEXT        'N'
 #define CMD_PREV        'P'
 #define CMD_EMERGENCY   'E'
 #define CMD_IDENT       'I'
+#define CMD_LOC         'L'
 
 #define DEBOUNCE_MS     150
 
+/* Min interval between forwarded GPS fixes (protects the server even
+ * if the APK-side interval is misconfigured) */
+#define LOC_MIN_MS      5000
+
 /* PTT socket name (abstract namespace, must match pttbridge.apk) */
 #define PTT_SOCKET_NAME "ptt_bridge"
+
+/* Location socket name (abstract namespace, we listen, pttbridge.apk
+ * connects and writes one "lat lon alt speed bearing accuracy" line
+ * per GPS fix) */
+#define LOC_SOCKET_NAME "porto_loc"
 
 /* Default config path (auto-loaded if no args given) */
 #define DEFAULT_CONFIG  "/data/local/tmp/knob.conf"
@@ -238,6 +271,139 @@ static int ptt_send(int fd, int pressed) {
     ssize_t n = write(fd, &msg, 1);
     if (n <= 0) return -1;
     return 0;
+}
+
+/* ---- Location socket (GPS fixes from pttbridge.apk) ---- */
+
+static int try_resolve_udp(void);   /* defined in the DNS section below */
+
+/* Create the abstract-namespace listening socket for GPS fixes.
+ * Returns the listening fd, or -1 on failure (feature disabled). */
+static int loc_listen(void) {
+    int fd;
+    struct sockaddr_un addr;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, LOC_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOC_SOCKET_NAME);
+
+    if (bind(fd, (struct sockaddr *)&addr, len) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 4) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Round a double to a signed 32-bit int without libm */
+static int round_i32(double v) {
+    return (int)(v >= 0 ? v + 0.5 : v - 0.5);
+}
+
+/* Build the 60-byte 'L' position packet (layout in the header comment) */
+static void build_loc_packet(unsigned char pkt[LOC_PKT_SIZE],
+                             double lat, double lon, double alt,
+                             float speed, float course, float acc) {
+    unsigned int ts;
+    struct timespec now;
+    int lat_i = round_i32(lat * 1e7);
+    int lon_i = round_i32(lon * 1e7);
+    int alt_i = round_i32(alt);
+    int spd_i = round_i32(speed * 10.0);
+    int crs_i = round_i32(course * 10.0);
+    int acc_i = round_i32(acc);
+
+    if (alt_i >  32767) alt_i =  32767;
+    if (alt_i < -32768) alt_i = -32768;
+    if (spd_i < 0)      spd_i = 0;
+    if (spd_i > 65535)  spd_i = 65535;
+    while (crs_i < 0)     crs_i += 3600;
+    while (crs_i >= 3600) crs_i -= 3600;
+    if (acc_i < 0)   acc_i = 0;
+    if (acc_i > 255) acc_i = 255;
+
+    pkt[0] = (unsigned char)CMD_LOC;
+    memset(pkt + 1, 0, RADIO_ID_LEN);
+    strncpy((char *)(pkt + 1), cfg_radio_id, RADIO_ID_LEN);
+    clock_gettime(CLOCK_REALTIME, &now);
+    ts = (unsigned int)now.tv_sec;
+    pkt[9]  = (ts >> 24) & 0xff;
+    pkt[10] = (ts >> 16) & 0xff;
+    pkt[11] = (ts >> 8)  & 0xff;
+    pkt[12] = ts & 0xff;
+    pkt[13] = ((unsigned int)lat_i >> 24) & 0xff;
+    pkt[14] = ((unsigned int)lat_i >> 16) & 0xff;
+    pkt[15] = ((unsigned int)lat_i >> 8)  & 0xff;
+    pkt[16] = (unsigned int)lat_i & 0xff;
+    pkt[17] = ((unsigned int)lon_i >> 24) & 0xff;
+    pkt[18] = ((unsigned int)lon_i >> 16) & 0xff;
+    pkt[19] = ((unsigned int)lon_i >> 8)  & 0xff;
+    pkt[20] = (unsigned int)lon_i & 0xff;
+    pkt[21] = ((unsigned int)alt_i >> 8) & 0xff;
+    pkt[22] = (unsigned int)alt_i & 0xff;
+    pkt[23] = ((unsigned int)spd_i >> 8) & 0xff;
+    pkt[24] = (unsigned int)spd_i & 0xff;
+    pkt[25] = ((unsigned int)crs_i >> 8) & 0xff;
+    pkt[26] = (unsigned int)crs_i & 0xff;
+    pkt[27] = (unsigned char)acc_i;
+    hmac_sha256((const unsigned char *)cfg_secret, strlen(cfg_secret),
+                pkt, LOC_PAYLOAD_LEN, pkt + LOC_PAYLOAD_LEN);
+}
+
+/* Accept one connection on the loc socket, read a fix line, forward it
+ * as a signed UDP packet. Rate-limited to one packet per LOC_MIN_MS. */
+static void handle_loc_client(int listen_fd, long long *last_loc_send) {
+    char buf[256];
+    double lat, lon, alt;
+    float speed, course, acc;
+    unsigned char pkt[LOC_PKT_SIZE];
+    int total = 0;
+
+    int cfd = accept(listen_fd, NULL, NULL);
+    if (cfd < 0) return;
+
+    /* The APK writes immediately then closes; don't stall the event
+     * loop for more than half a second if it misbehaves */
+    struct timeval tv = {0, 500000};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (total < (int)sizeof(buf) - 1) {
+        int n = read(cfd, buf + total, sizeof(buf) - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        if (memchr(buf, '\n', total)) break;
+    }
+    close(cfd);
+    buf[total] = '\0';
+
+    if (sscanf(buf, "%lf %lf %lf %f %f %f",
+               &lat, &lon, &alt, &speed, &course, &acc) != 6)
+        return;
+
+    long long now = now_ms();
+    if (now - *last_loc_send < LOC_MIN_MS) return;
+
+    if (want_udp && !udp_enabled) try_resolve_udp();
+    if (!udp_enabled) return;
+
+    *last_loc_send = now;
+    build_loc_packet(pkt, lat, lon, alt, speed, course, acc);
+    if (sendto(udp_fd, pkt, LOC_PKT_SIZE, 0,
+               (struct sockaddr *)&udp_dest, sizeof(udp_dest)) < 0) {
+        fprintf(stderr, "loc sendto: %s\n", strerror(errno));
+        return;
+    }
+    printf("porto-watchdog: LOC %.5f %.5f (%s)\n", lat, lon, cfg_radio_id);
+    fflush(stdout);
 }
 
 /* ---- UDP packet ---- */
@@ -551,12 +717,13 @@ static int load_config(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-    int btn_fd, knob_fd = -1, ptt_fd_dev = -1;
+    int btn_fd, knob_fd = -1, ptt_fd_dev = -1, loc_fd = -1;
     struct input_event ev;
     long long last_knob_send = 0;
     long long last_btn_send = 0;
+    long long last_loc_send = 0;
     unsigned char pkt[PKT_SIZE];
-    struct pollfd fds[3];
+    struct pollfd fds[4];
     int nfds;
     int config_loaded = 0;
 
@@ -661,6 +828,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* 4. Location socket - only useful when UDP is configured. pttbridge.apk
+     * connects here with GPS fixes (and only reads GPS at all when
+     * /data/local/tmp/loc.conf exists - see README). */
+    if (want_udp) {
+        loc_fd = loc_listen();
+        if (loc_fd < 0)
+            fprintf(stderr, "porto-watchdog: loc socket unavailable (GPS reporting disabled)\n");
+    }
+
     /* Startup banner */
     printf("porto-watchdog: TE300K all-in-one handler\n");
     printf("porto-watchdog: buttons=%s (PTT%s)\n",
@@ -675,16 +851,18 @@ int main(int argc, char *argv[]) {
         printf("porto-watchdog: UDP target=%s:%d radio=%s [%s]\n",
                cfg_host, cfg_port, cfg_radio_id,
                udp_enabled ? "OK" : "waiting for DNS");
+    if (loc_fd >= 0)
+        printf("porto-watchdog: loc socket=@%s (GPS -> 'L' packets)\n",
+               LOC_SOCKET_NAME);
     fflush(stdout);
 
-    /* Set up poll: btn_fd always present, knob_fd and ptt_fd_dev optional.
-     * Layout: fds[0]=buttons, fds[1]=knob (or RSM if no knob), fds[2]=RSM */
+    /* Set up poll: btn_fd always present, the rest optional. */
     nfds = 0;
     fds[nfds].fd = btn_fd;
     fds[nfds].events = POLLIN;
     nfds++;
 
-    int knob_poll_idx = -1, ptt_poll_idx = -1;
+    int knob_poll_idx = -1, ptt_poll_idx = -1, loc_poll_idx = -1;
 
     if (knob_fd >= 0) {
         knob_poll_idx = nfds;
@@ -695,6 +873,12 @@ int main(int argc, char *argv[]) {
     if (ptt_fd_dev >= 0) {
         ptt_poll_idx = nfds;
         fds[nfds].fd = ptt_fd_dev;
+        fds[nfds].events = POLLIN;
+        nfds++;
+    }
+    if (loc_fd >= 0) {
+        loc_poll_idx = nfds;
+        fds[nfds].fd = loc_fd;
         fds[nfds].events = POLLIN;
         nfds++;
     }
@@ -768,6 +952,11 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        /* GPS fixes from pttbridge.apk (abstract socket) */
+        if (loc_poll_idx >= 0 && (fds[loc_poll_idx].revents & POLLIN)) {
+            handle_loc_client(loc_fd, &last_loc_send);
+        }
+
         /* RSM PTT events: event2 (telo_ptt) */
         if (ptt_poll_idx >= 0 && (fds[ptt_poll_idx].revents & POLLIN)) {
             ssize_t n = read(ptt_fd_dev, &ev, sizeof(ev));
@@ -793,6 +982,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (udp_fd >= 0) close(udp_fd);
+    if (loc_fd >= 0) close(loc_fd);
     if (ptt_fd_dev >= 0) close(ptt_fd_dev);
     if (knob_fd >= 0) close(knob_fd);
     close(btn_fd);

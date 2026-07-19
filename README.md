@@ -18,6 +18,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Connect notification** - when a radio powers on and joins the server, it receives a spoken confirmation that it is connected and which channel it is in
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
 - **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
+- **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
@@ -323,6 +324,67 @@ Test everything:
 
 **Done. Unplug the USB cable. The radio is onboarded.**
 
+## GPS Tracking (TAK integration)
+
+Radios can report their GPS position through the same signed UDP channel
+used for buttons and the knob. The remote watchdog translates each
+position report into a Cursor-on-Target event and streams it to a TAK
+server, where every radio appears as a live marker in ATAK / WinTAK /
+WebTAK. Nothing else is installed on the radio - `pttbridge.apk` reads
+the GPS and hands fixes to the local watchdog.
+
+How it flows:
+
+```
+GPS fix -> pttbridge.apk -> porto-watchdog (local)
+        -> signed UDP 'L' packet -> porto-watchdog (remote)
+        -> CoT XML over TCP -> TAK server -> ATAK map
+```
+
+The feature is **off by default** on both ends.
+
+**Server side** - point the remote watchdog at your TAK server:
+
+1. On the TAK server, create a streaming input: web UI ->
+   **Configuration -> Input Manager -> Add Input**, protocol `tcp`,
+   port `8087`. Only the porto-watchdog container needs to reach this
+   port - do not expose it to the internet (use a shared Docker
+   network or firewall it to the docker host).
+2. Set `TAK_HOST` (and optionally the other `TAK_*` variables, see
+   table below) on the porto-watchdog container and restart it.
+3. Optional: friendly names on the map via
+   `TAK_CALLSIGNS: "radio01=Dad,radio02=Mom"`. Without it the marker
+   uses the radio's Mumla username (or radio_id if the mapping is a
+   wildcard).
+
+**Radio side** - one-time, per radio:
+
+```bash
+# Grant the location permission to pttbridge (needed once)
+adb shell pm grant com.pttbridge android.permission.ACCESS_FINE_LOCATION
+
+# Make sure the GPS provider is enabled on the device
+adb shell settings put secure location_providers_allowed +gps
+
+# Opt in: GPS update interval in seconds (delete the file to disable)
+adb shell "echo 30 > /data/local/tmp/loc.conf"
+```
+
+Reboot the radio. About 20 seconds after boot, `pttbridge.apk` reads
+`loc.conf` and starts listening to the GPS at the configured interval;
+each fix is forwarded as a signed `'L'` packet. The local watchdog
+additionally rate-limits reports to one per 5 seconds.
+
+Notes:
+
+- The interval is a trade-off between map freshness, battery, and
+  mobile data. 30-60s is plenty for vehicles; data usage is negligible
+  (~60 bytes UDP per report).
+- Position packets carry lat/lon, altitude, speed, course, and GPS
+  accuracy, and are HMAC-signed and replay-protected like every other
+  packet. A radio with no `loc.conf` never touches the GPS at all.
+- First GPS fix after power-on can take a couple of minutes cold.
+
 ## Adding More Radios
 
 Repeat Step 2 with a different `radio_id` in `knob.conf`.
@@ -369,6 +431,17 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `CONNECT_MESSAGE_FORMAT` | {username} {channel} connected | Connect message template |
 | `LOG_LEVEL` | INFO | DEBUG, INFO, WARNING, ERROR |
 | `RADIOS` | *(required)* | Radio-to-user mapping |
+| `TAK_HOST` | *(empty=disabled)* | TAK server hostname/IP for GPS forwarding |
+| `TAK_PORT` | 8087 | TAK streaming input port |
+| `TAK_TLS` | false | Use TLS for the TAK connection |
+| `TAK_CA_FILE` | *(empty)* | CA cert for TLS (empty = no verification) |
+| `TAK_CERT_FILE` | *(empty)* | Client cert PEM for TLS client auth |
+| `TAK_KEY_FILE` | *(empty)* | Client key PEM for TLS client auth |
+| `TAK_COT_TYPE` | a-f-G-U-C | CoT event type for radio markers |
+| `TAK_STALE` | 300 | Seconds until a marker goes stale in ATAK |
+| `TAK_TEAM` | Cyan | ATAK team color |
+| `TAK_ROLE` | Team Member | ATAK role shown on the marker |
+| `TAK_CALLSIGNS` | *(empty)* | Per-radio callsigns: `radio01=Dad,radio02=Mom` |
 
 ## Security
 
@@ -398,7 +471,8 @@ must be re-keyed.
 | `channel_bot.py` | Docker | Remote watchdog server |
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
-| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect |
+| `pttbridge/` | Source | Smali source for pttbridge.apk (build docs inside) |
+| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect + GPS reader |
 | `mumla.apk` | Radio | Mumla v3.6.15 - open-source Mumble client ([GPL-3.0](https://github.com/quite/mumla)) |
 
 Binaries are built automatically by CI - download `porto-watchdog` from
@@ -417,9 +491,10 @@ the [latest release](../../releases/latest) or the
 - **Auto-start not working after reboot** - check logcat: `adb shell logcat -d | grep -i pttbridge`. Also check the binary exists: `adb shell ls -la /data/local/tmp/porto-watchdog` and the symlink: `adb shell ls -la /data/local/tmp/ptt_bridge`
 - **DNS not resolving on the radio** - check logcat: `adb shell logcat -d | grep porto-watchdog`. If you see "DNS not ready", the radio's WiFi may not be connected yet. The binary retries DNS on every keypress. You can also use an IP address directly in `knob.conf` to bypass DNS entirely
 - **No TTS** - enable Text-to-Speech in Mumla settings on the radio
+- **No GPS markers in ATAK** - check the chain step by step: `adb shell logcat -d | grep porto-watchdog` should show `LOC <lat> <lon>` lines when fixes flow. No lines? Check `loc.conf` exists, the location permission is granted (`adb shell dumpsys package com.pttbridge | grep ACCESS_FINE`), and GPS is enabled (`adb shell settings get secure location_providers_allowed`). Lines but no markers? Check the remote watchdog logs (`docker logs porto-watchdog`) for `TAK: connected` / `TAK: first position`, and that the TAK input on port 8087 exists and is reachable from the container
+- **Radio has no GPS fix indoors** - normal; cold start can take minutes and needs sky view. Test near a window or outside
 
 ## Roadmap
 
-- **GPS tracking** - enable GPS functionality on the radios for location sharing, useful for integration with platforms like CivTAK for shared situational awareness
 - **LED control** - adjust LED behavior based on external input and user preferences
 - **Home screen LCD** - replace the stock home screen with a custom display showing current channel, signal status, and radio info on the TE300K's small screen

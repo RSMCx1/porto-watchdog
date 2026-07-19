@@ -48,6 +48,21 @@ services:
       CONNECT_MESSAGE_ENABLED: "true"
       CONNECT_MESSAGE_FORMAT: "{username} {channel} connected"
 
+      # -- GPS -> TAK forwarding (optional, disabled unless TAK_HOST set) --
+      # Radios with GPS enabled (see README) report positions which are
+      # forwarded to a TAK server as Cursor-on-Target events.
+      # TAK_HOST: takserver              # TAK server hostname/IP
+      # TAK_PORT: "8087"                 # TAK streaming input port (TCP)
+      # TAK_TLS: "false"                 # true = TLS input (8089-style)
+      # TAK_CA_FILE: ""                  # CA cert (TLS; empty = no verify)
+      # TAK_CERT_FILE: ""                # client cert PEM (TLS with client auth)
+      # TAK_KEY_FILE: ""                 # client key PEM
+      # TAK_COT_TYPE: "a-f-G-U-C"        # CoT event type
+      # TAK_STALE: "300"                 # seconds until a marker goes stale
+      # TAK_TEAM: "Cyan"                 # ATAK team color
+      # TAK_ROLE: "Team Member"          # ATAK role
+      # TAK_CALLSIGNS: "radio01=Dad"     # per-radio callsign override
+
       # -- Logging --
       LOG_LEVEL: INFO
 

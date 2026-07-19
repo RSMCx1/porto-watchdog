@@ -403,6 +403,15 @@ Reboot the radio. About 20 seconds after boot, `pttbridge.apk` reads
 each fix is forwarded as a signed `'L'` packet. The local watchdog
 additionally rate-limits reports to one per 5 seconds.
 
+The same five commands upgrade a radio that was onboarded before GPS
+support existed - `adb install -r` updates the app in place and
+nothing else changes.
+
+No TAK configuration ever touches the radio: position reports travel
+over the same UDP channel (and port) as the knob and buttons, so any
+radio that can switch channels can report positions - from any
+network, including public cellular.
+
 Notes:
 
 - The interval is a trade-off between map freshness, battery, and
@@ -411,6 +420,10 @@ Notes:
 - Position packets carry lat/lon, altitude, speed, course, and GPS
   accuracy, and are HMAC-signed and replay-protected like every other
   packet. A radio with no `loc.conf` never touches the GPS at all.
+- Position reports are authenticated but **not encrypted** in transit:
+  an observer on the network path can read coordinates (not voice -
+  that is encrypted by Mumble). Payload encryption is on the roadmap;
+  until then, treat position privacy accordingly.
 - First GPS fix after power-on can take a couple of minutes cold.
 
 ## Adding More Radios

@@ -516,19 +516,28 @@ Notes:
   (powered off, out of coverage), the server keeps re-broadcasting
   its last known position every 60 seconds, marked "last known" with
   a last-seen timestamp in the marker's remarks. The state is
-  persisted in the certs volume, so it survives server restarts.
+  persisted in the `porto-tracks` volume, so it survives server
+  restarts.
   Disable with `TAK_LAST_KNOWN: "false"`.
 - **Track history**: every position is appended to
-  `/app/certs/tracks/<radio_id>.jsonl` (disable with
+  `/app/tracks/<radio_id>.jsonl` in the dedicated `porto-tracks`
+  volume (disable with
   `TRACK_HISTORY: "false"`). Export a day - or everything - as GPX:
   ```bash
   docker exec porto-watchdog python channel_bot.py --export-gpx radio01 2026-07-20 > trip.gpx
   ```
-  Roughly 300 KB per radio per day at a 30s interval.
+  Roughly 300 KB per radio per day at a 30s interval. Exports and
+  trails are jitter-filtered by default; add `--raw` to `--export-gpx`
+  for the unfiltered archive.
 - **Trails on the map**: each radio drags a named line ("P1 trail")
   showing where it has been - the last `TAK_TRAIL_HOURS` (default 6)
   of its track, redrawn every 5 minutes so the map never accumulates
-  a forever-trail. `TAK_TRAIL: "false"` disables. For longer history,
+  a forever-trail. Trails are jitter-filtered: fixes with poor
+  reported accuracy are dropped (`TRAIL_MAX_ACC`) and the line only
+  gains a point once the radio actually moved `TRAIL_MIN_DIST` meters
+  (default 20) - a parked radio shows a clean marker instead of a
+  GPS-noise scribble, and its trail disappears entirely until it
+  moves again. `TAK_TRAIL: "false"` disables. For longer history,
   ask for any day or date range on demand - **straight from TAK's
   chat**: send `trail P1`, `trail P1 yesterday`, or
   `trail P1 2026-07-18 2026-07-22` to All Chat Rooms (works in ATAK,
@@ -664,7 +673,9 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `TAK_TRAIL_HOURS` | 6 | Hours of track shown in the rolling trail |
 | `TAK_BOT_POSITION` | *(empty = 0,0)* | "lat,lon" for the bot's own map marker (it must announce presence to receive chat commands) |
 | `TRACK_HISTORY` | true | Log every position to a per-radio history file |
-| `TRACK_DIR` | /app/certs/tracks | Where position history is stored |
+| `TRACK_DIR` | /app/tracks | Where position history is stored (`porto-tracks` volume) |
+| `TRAIL_MIN_DIST` | 20 | Meters a radio must move before a trail gains a point (GPS jitter deadband, 0 = off) |
+| `TRAIL_MAX_ACC` | 75 | Drop fixes with worse reported accuracy (meters) from trails/exports (0 = off) |
 | `TAK_TEAM` | Cyan | ATAK team color |
 | `TAK_ROLE` | Team Member | ATAK role shown on the marker |
 | `TAK_CALLSIGNS` | *(empty)* | Per-radio callsigns: `radio01=Dad,radio02=Mom` |

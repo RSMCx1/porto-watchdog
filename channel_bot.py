@@ -176,8 +176,8 @@ def parse_loc_packet(data, secret):
 
 
 def read_track_points(track_dir, radio_id, t_from, t_to):
-    """Read (ts, lat, lon) tuples from the radio's history log,
-    filtered to [t_from, t_to). Malformed lines are skipped."""
+    """Read (ts, lat, lon, accuracy) tuples from the radio's history
+    log, filtered to [t_from, t_to). Malformed lines are skipped."""
     path = os.path.join(track_dir, radio_id + '.jsonl')
     points = []
     try:
@@ -189,10 +189,44 @@ def read_track_points(track_dir, radio_id, t_from, t_to):
                 except (ValueError, KeyError):
                     continue
                 if t_from <= ts < t_to:
-                    points.append((ts, entry['lat'], entry['lon']))
+                    points.append((ts, entry['lat'], entry['lon'],
+                                   entry.get('accuracy')))
     except FileNotFoundError:
         pass
     return points
+
+
+def _dist_m(lat1, lon1, lat2, lon2):
+    """Approximate distance in meters (equirectangular - plenty for
+    deadband scales)."""
+    import math
+    dx = (lon2 - lon1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+    dy = (lat2 - lat1) * 110540.0
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def clean_track(points, min_dist_m, max_acc_m):
+    """Tidy a raw track for display: drop fixes with poor reported
+    accuracy, then apply a distance deadband - a point only counts
+    once the radio moved min_dist_m from the last kept point. This is
+    the standard jitter filter (stationary GPS scatter collapses to a
+    single point instead of a zigzag star). The final fix is always
+    kept so a live trail connects to the radio's marker.
+    Returns (ts, lat, lon) tuples; raw history is never modified.
+    """
+    if max_acc_m:
+        points = [p for p in points
+                  if p[3] is None or p[3] <= max_acc_m] or points
+    if not points:
+        return []
+    kept = [points[0]]
+    for p in points[1:]:
+        if not min_dist_m or _dist_m(kept[-1][1], kept[-1][2],
+                                     p[1], p[2]) >= min_dist_m:
+            kept.append(p)
+    if kept[-1][0] != points[-1][0]:
+        kept.append(points[-1])
+    return [(ts, lat, lon) for ts, lat, lon, _ in kept]
 
 
 def thin_points(points, max_n):
@@ -264,14 +298,19 @@ class TAKForwarder:
         # Last-known persistence: radios stay on the map after they stop
         # reporting (power-off, no coverage) and across bot restarts.
         self.last_known = config.get('tak_last_known', True)
-        self.state_file = os.path.join(
-            config.get('cert_dir', '/app/certs'), 'tak_state.json')
         self.track_dir = config.get('track_dir', '')
+        # State lives with the tracks (dedicated volume) when history
+        # is on; certs volume otherwise
+        self.state_file = os.path.join(
+            self.track_dir or config.get('cert_dir', '/app/certs'),
+            'tak_state.json')
         self.last_seen = {}         # radio_id -> ts of last live report
         self.last_known_sent = {}   # radio_id -> ts of last re-broadcast
         # Rolling trails drawn from the track history
         self.trail = config.get('tak_trail', True)
         self.trail_hours = config.get('tak_trail_hours', 6)
+        self.trail_min_dist = config.get('trail_min_dist', 20)
+        self.trail_max_acc = config.get('trail_max_acc', 75)
         self._last_trail_publish = 0
         # Active emergency alerts, cancellable via the ident button
         self.active_emergency = {}  # radio_id -> alert expiry ts
@@ -290,6 +329,9 @@ class TAKForwarder:
             except ValueError:
                 log.warning("TAK_BOT_POSITION must be 'lat,lon' - got %r", pos)
         self._load_state()
+        # Radios that may have a published trail on the map (assume all
+        # known ones after a restart, so collapsed trails get retired)
+        self._trail_active = set(self.last_fix)
 
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
         # (and renews) its own client certificate from the TAK server's
@@ -333,6 +375,7 @@ class TAKForwarder:
 
     def _save_state(self):
         try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             state = {rid: {'fix': self.last_fix[rid],
                            'callsign': self.last_callsign.get(rid, rid),
                            'ts': self.last_seen.get(rid, 0),
@@ -732,7 +775,9 @@ class TAKForwarder:
             return
         if t_to <= t_from:
             t_from, t_to = t_to - 86400, t_from + 86400
-        points = read_track_points(self.track_dir, radio_id, t_from, t_to)
+        points = clean_track(
+            read_track_points(self.track_dir, radio_id, t_from, t_to),
+            self.trail_min_dist, self.trail_max_acc)
         label = time.strftime('%Y-%m-%d', time.gmtime(t_from))
         if t_to - t_from > 86400:
             label += '..' + time.strftime('%Y-%m-%d', time.gmtime(t_to - 86400))
@@ -863,12 +908,32 @@ class TAKForwarder:
     def _publish_rolling_trails(self):
         now = time.time()
         for radio_id in list(self.last_fix):
-            points = read_track_points(
-                self.track_dir, radio_id,
-                now - self.trail_hours * 3600, now + 1)
+            points = clean_track(
+                read_track_points(self.track_dir, radio_id,
+                                  now - self.trail_hours * 3600, now + 1),
+                self.trail_min_dist, self.trail_max_acc)
+            # a two-point stub shorter than the deadband is "hasn't
+            # moved" - treat like an empty trail
+            if (len(points) == 2 and self.trail_min_dist
+                    and _dist_m(points[0][1], points[0][2],
+                                points[1][1], points[1][2])
+                    < self.trail_min_dist):
+                points = []
             if self.publish_trail(radio_id, points):
+                self._trail_active.add(radio_id)
                 log.debug("TAK: trail refreshed for %s (%d points)",
                           radio_id, len(points))
+            elif radio_id in self._trail_active:
+                # Trail collapsed (stationary radio) - retire the cached
+                # line with an instantly-stale replacement, or the old
+                # zigzag would be replayed to clients forever
+                fix = self.last_fix[radio_id]
+                stub = [(0, fix['lat'], fix['lon'])] * 2
+                cs = self.last_callsign.get(radio_id, radio_id)
+                self._transmit(self._build_trail_event(
+                    'porto-{}-trail'.format(radio_id),
+                    '{} trail'.format(cs), stub, 1).encode('utf-8'))
+                self._trail_active.discard(radio_id)
 
     LAST_KNOWN_RESEND_S = 60
     LAST_KNOWN_SILENCE_S = 90
@@ -1469,8 +1534,10 @@ def load_env_config():
         'tak_trail': env_bool('TAK_TRAIL', 'true'),
         'tak_trail_hours': float(os.environ.get('TAK_TRAIL_HOURS', '6')),
         'tak_bot_position': os.environ.get('TAK_BOT_POSITION', '').strip(),
-        'track_dir': (os.environ.get('TRACK_DIR', '/app/certs/tracks')
+        'track_dir': (os.environ.get('TRACK_DIR', '/app/tracks')
                       if env_bool('TRACK_HISTORY', 'true') else ''),
+        'trail_min_dist': float(os.environ.get('TRAIL_MIN_DIST', '20')),
+        'trail_max_acc': float(os.environ.get('TRAIL_MAX_ACC', '75')),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
         'tak_stale': int(os.environ.get('TAK_STALE', '300')),
         'tak_team': os.environ.get('TAK_TEAM', 'Cyan'),
@@ -1520,12 +1587,13 @@ def load_env_config():
     return config
 
 
-def export_gpx(track_dir, radio_id, day=None):
+def export_gpx(track_dir, radio_id, day=None, raw=False,
+               min_dist=20, max_acc=75):
     """Print a GPX track built from the radio's history log.
-    day: optional 'YYYY-MM-DD' (UTC) filter.
-    """
+    day: optional 'YYYY-MM-DD' (UTC) filter. raw=True skips the
+    jitter filter (full unfiltered archive)."""
     path = os.path.join(track_dir, radio_id + '.jsonl')
-    points = []
+    entries = []
     with open(path) as f:
         for line in f:
             try:
@@ -1535,19 +1603,26 @@ def export_gpx(track_dir, radio_id, day=None):
             if day and time.strftime(
                     '%Y-%m-%d', time.gmtime(entry['ts'])) != day:
                 continue
-            points.append(entry)
+            entries.append(entry)
+    alts = {e['ts']: e.get('alt', 0) for e in entries}
+    points = [(e['ts'], e['lat'], e['lon'], e.get('accuracy'))
+              for e in entries]
+    if raw:
+        points = [(ts, lat, lon) for ts, lat, lon, _ in points]
+    else:
+        points = clean_track(points, min_dist, max_acc)
     print('<?xml version="1.0" encoding="UTF-8"?>')
     print('<gpx version="1.1" creator="porto-watchdog"'
           ' xmlns="http://www.topografix.com/GPX/1/1">')
     name = radio_id + (' ' + day if day else '')
     print(f'<trk><name>{name}</name><trkseg>')
-    for e in points:
-        iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(e['ts']))
-        print(f'<trkpt lat="{e["lat"]:.7f}" lon="{e["lon"]:.7f}">'
-              f'<ele>{e.get("alt", 0)}</ele><time>{iso}</time></trkpt>')
+    for ts, lat, lon in points:
+        iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
+        print(f'<trkpt lat="{lat:.7f}" lon="{lon:.7f}">'
+              f'<ele>{alts.get(ts, 0)}</ele><time>{iso}</time></trkpt>')
     print('</trkseg></trk></gpx>')
-    log_msg = f"{len(points)} points"
-    print(f'<!-- {log_msg} -->', file=sys.stderr)
+    print(f'<!-- {len(points)} points{" (raw)" if raw else ""} -->',
+          file=sys.stderr)
 
 
 def publish_dated_trail(config, radio_id, day, day_end=None, ttl_min=60):
@@ -1557,12 +1632,15 @@ def publish_dated_trail(config, radio_id, day, day_end=None, ttl_min=60):
     t_from = calendar.timegm(time.strptime(day, '%Y-%m-%d'))
     t_to = calendar.timegm(
         time.strptime(day_end or day, '%Y-%m-%d')) + 86400
-    points = read_track_points(config['track_dir'], radio_id, t_from, t_to)
+    fwd = TAKForwarder(config)
+    points = clean_track(
+        read_track_points(config['track_dir'], radio_id, t_from, t_to),
+        fwd.trail_min_dist, fwd.trail_max_acc)
     if len(points) < 2:
         print(f"No track data for {radio_id} in {day}"
               f"{'..' + day_end if day_end else ''}", file=sys.stderr)
+        fwd.close()
         return 1
-    fwd = TAKForwarder(config)
     fwd.last_callsign[radio_id] = (config['tak_callsigns'].get(radio_id)
                                    or fwd.last_callsign.get(radio_id, radio_id))
     name = day + ('..' + day_end if day_end else '')
@@ -1593,12 +1671,17 @@ def main():
     p.add_argument('--trail-ttl', type=int, default=60, metavar='MIN',
                    help='Minutes a published dated trail stays on the '
                         'map (default 60)')
+    p.add_argument('--raw', action='store_true',
+                   help='With --export-gpx: skip the jitter filter')
     args = p.parse_args()
 
     if args.export_gpx:
-        track_dir = (os.environ.get('TRACK_DIR', '/app/certs/tracks'))
+        track_dir = (os.environ.get('TRACK_DIR', '/app/tracks'))
         export_gpx(track_dir, args.export_gpx[0],
-                   args.export_gpx[1] if len(args.export_gpx) > 1 else None)
+                   args.export_gpx[1] if len(args.export_gpx) > 1 else None,
+                   raw=args.raw,
+                   min_dist=float(os.environ.get('TRAIL_MIN_DIST', '20')),
+                   max_acc=float(os.environ.get('TRAIL_MAX_ACC', '75')))
         return
 
     if args.publish_trail:

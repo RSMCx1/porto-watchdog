@@ -87,9 +87,12 @@ services:
       # Persist bot certificate so it keeps the same identity across restarts
       # (required for Mumble ACL/registration)
       - porto-certs:/app/certs
+      # Location history + last-known state (see GPS section in README)
+      - porto-tracks:/app/tracks
       # TAK client certificate for TLS auth (see GPS section in README)
       # - ./takcerts:/app/takcerts:ro
     restart: unless-stopped
 
 volumes:
   porto-certs:
+  porto-tracks:

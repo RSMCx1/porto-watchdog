@@ -13,6 +13,16 @@
  *     /dev/input/event3  KEY_F3 (61)  = Emergency broadcast (the RSM's
  *                        emergency button also surfaces here, NOT on
  *                        event2 - verified on real hardware)
+ *     + a minutely 'H' heartbeat packet (same 45-byte format) that
+ *       keeps the NAT return path open for server replies
+ *
+ *   INBOUND (server → radio, same UDP socket):
+ *     'C' channel packet (77 bytes): cmd(1) + radio_id(8) + ts(4) +
+ *     channel name(32, utf-8 null-padded) + HMAC-SHA256(32) over
+ *     bytes [0..44]. Verified (id + HMAC + 30s replay window) and
+ *     written to /data/local/tmp/channel.txt, which the patched
+ *     Te300k idle screen displays ("Channel: X" / "Disconnected").
+ *     Empty name = our user is not connected to Mumble.
  *     /dev/input/event4  KEY_F13 (183) = Previous channel
  *     /dev/input/event4  KEY_F14 (184) = Next channel
  *     GPS fixes from pttbridge.apk (abstract socket "porto_loc")
@@ -215,6 +225,15 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 #define CMD_EMERGENCY   'E'
 #define CMD_IDENT       'I'
 #define CMD_LOC         'L'
+#define CMD_HEARTBEAT   'H'
+
+/* Server -> radio channel packet */
+#define CHANNEL_PKT_SIZE   77   /* cmd + radio_id + ts + name(32) + HMAC */
+#define CHANNEL_NAME_LEN   32
+#define CHANNEL_SIGNED_LEN 45   /* bytes covered by the HMAC */
+#define CHANNEL_FILE   "/data/local/tmp/channel.txt"
+#define HEARTBEAT_MS    60000
+#define CHANNEL_REPLAY_S   30
 
 #define DEBOUNCE_MS     150
 
@@ -756,6 +775,54 @@ static int send_udp_command(int sock_fd, struct sockaddr_in *dest,
     return 1;
 }
 
+/* ---- Channel feedback (server -> radio) ----
+ * The server replies to every packet we send (including the minutely
+ * 'H' heartbeat) with a signed 'C' packet carrying our current Mumble
+ * channel name. After verification it lands in CHANNEL_FILE, which
+ * the (patched) Te300k idle screen polls. Empty name = our user is
+ * not connected to Mumble; the screen shows "Disconnected".
+ *
+ * CHANNEL_FILE must already exist with mode 666 (onboarding does
+ * touch + chmod) - /data/local/tmp itself is not writable by our
+ * uid, but an existing world-writable file in it is. */
+static unsigned int last_channel_ts = 0;
+
+static void handle_channel_packet(void) {
+    unsigned char buf[CHANNEL_PKT_SIZE + 16];
+    unsigned char mac[32];
+    char name[CHANNEL_NAME_LEN + 2];
+    unsigned int ts, now;
+    size_t len;
+    ssize_t n, w;
+    int fd;
+
+    n = recvfrom(udp_fd, buf, sizeof(buf), 0, NULL, NULL);
+    if (n != CHANNEL_PKT_SIZE || buf[0] != 'C') return;
+    if (strncmp((const char *)buf + 1, cfg_radio_id, RADIO_ID_LEN) != 0)
+        return;
+    hmac_sha256((const unsigned char *)cfg_secret, strlen(cfg_secret),
+                buf, CHANNEL_SIGNED_LEN, mac);
+    if (memcmp(mac, buf + CHANNEL_SIGNED_LEN, 32) != 0) return;
+    ts = ((unsigned int)buf[9] << 24) | ((unsigned int)buf[10] << 16) |
+         ((unsigned int)buf[11] << 8) | (unsigned int)buf[12];
+    now = (unsigned int)time(NULL);
+    if (ts + CHANNEL_REPLAY_S < now || now + CHANNEL_REPLAY_S < ts) return;
+    if (ts < last_channel_ts) return;   /* never rewind to an older update */
+    last_channel_ts = ts;
+
+    memcpy(name, buf + 13, CHANNEL_NAME_LEN);
+    name[CHANNEL_NAME_LEN] = '\0';
+    fd = open(CHANNEL_FILE, O_WRONLY | O_TRUNC | O_CREAT, 0666);
+    if (fd < 0) return;
+    len = strlen(name);
+    if (len > 0) {
+        name[len] = '\n';
+        w = write(fd, name, len + 1);
+        (void)w;
+    }
+    close(fd);
+}
+
 /* ---- Config file ---- */
 
 static int load_config(const char *path) {
@@ -785,7 +852,7 @@ int main(int argc, char *argv[]) {
     long long last_btn_send = 0;
     long long last_loc_send = 0;
     unsigned char pkt[PKT_SIZE];
-    struct pollfd fds[4];
+    struct pollfd fds[5];
     int nfds;
     int config_loaded = 0;
 
@@ -925,6 +992,19 @@ int main(int argc, char *argv[]) {
     nfds++;
 
     int knob_poll_idx = -1, ptt_poll_idx = -1, loc_poll_idx = -1;
+    int udp_poll_idx = -1;
+    long long last_heartbeat = 0;
+
+    /* The UDP socket doubles as the receive path for 'C' channel
+     * packets - make sure it exists even before DNS resolves. */
+    if (want_udp && udp_fd < 0)
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd >= 0) {
+        udp_poll_idx = nfds;
+        fds[nfds].fd = udp_fd;
+        fds[nfds].events = POLLIN;
+        nfds++;
+    }
 
     if (knob_fd >= 0) {
         knob_poll_idx = nfds;
@@ -947,12 +1027,39 @@ int main(int argc, char *argv[]) {
 
     /* Main event loop */
     while (1) {
-        int ret = poll(fds, nfds, -1);
+        int ret = poll(fds, nfds, 1000);
         if (ret < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "poll: %s\n", strerror(errno));
             break;
         }
+
+        /* Minutely heartbeat: fetches a fresh channel name for the
+         * idle screen and keeps the NAT return path open so the
+         * server's replies reach us on cellular. First pass fires
+         * immediately after start. */
+        if (want_udp) {
+            long long hb_now = now_ms();
+            if (hb_now - last_heartbeat >= HEARTBEAT_MS || last_heartbeat == 0) {
+                last_heartbeat = hb_now;
+                if (!udp_enabled) try_resolve_udp();
+                if (udp_enabled) {
+                    build_packet(pkt, CMD_HEARTBEAT);
+                    if (sendto(udp_fd, pkt, PKT_SIZE, 0,
+                               (struct sockaddr *)&udp_dest,
+                               sizeof(udp_dest)) < 0)
+                        fprintf(stderr, "heartbeat sendto: %s\n",
+                                strerror(errno));
+                }
+            }
+        }
+
+        /* Server replies ('C' channel packets) */
+        if (udp_poll_idx >= 0 && (fds[udp_poll_idx].revents & POLLIN)) {
+            handle_channel_packet();
+        }
+
+        if (ret == 0) continue;
 
         /* Button events: event3 (gpio-keys) */
         if (fds[0].revents & POLLIN) {

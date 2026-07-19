@@ -15,6 +15,7 @@ License: GPLv3
 
 import sys
 import os
+import json
 import hmac
 import hashlib
 import ssl
@@ -75,11 +76,15 @@ def _loc_enc_key(secret):
 # Replay window: reject packets older than this (seconds)
 REPLAY_WINDOW = 30
 
-VALID_COMMANDS = ('N', 'P', 'E', 'I', 'L')
+VALID_COMMANDS = ('N', 'P', 'E', 'I', 'L', 'H')
 
 # Commands subject to the per-radio debounce (key presses; position
-# reports must never be debounced against them or vice versa)
+# reports and heartbeats must never be debounced against them)
 KEY_COMMANDS = ('N', 'P', 'E', 'I')
+
+# Server->radio channel packet: 'C' + radio_id(8) + ts(4) + name(32) + HMAC(32)
+CHANNEL_NAME_LEN = 32
+CHANNEL_PKT_SIZE = 1 + RADIO_ID_LEN + 4 + CHANNEL_NAME_LEN + HMAC_LEN
 
 
 # ============================================================================
@@ -170,6 +175,29 @@ def parse_loc_packet(data, secret):
     }
 
 
+def build_channel_packet(radio_id, channel_name, secret):
+    """Server->radio 'C' packet carrying the radio's current Mumble
+    channel name (empty = the radio's user is not on the server).
+    Signed and replay-windowed exactly like radio->server packets, so
+    nobody else can write to the radio's screen.
+    """
+    pkt = bytearray(CHANNEL_PKT_SIZE)
+    pkt[0] = ord('C')
+    rid = radio_id.encode('ascii', errors='replace')[:RADIO_ID_LEN]
+    pkt[1:1 + len(rid)] = rid
+    pkt[9:13] = struct.pack('>I', int(time.time()))
+    name = channel_name.encode('utf-8')[:CHANNEL_NAME_LEN]
+    # never end on a torn multi-byte sequence
+    while name and (name[-1] & 0xC0) == 0x80:
+        name = name[:-1]
+    if name and name[-1] >= 0xC0:
+        name = name[:-1]
+    pkt[13:13 + len(name)] = name
+    pkt[45:CHANNEL_PKT_SIZE] = hmac.new(
+        secret.encode('utf-8'), bytes(pkt[:45]), hashlib.sha256).digest()
+    return bytes(pkt)
+
+
 # ============================================================================
 # TAK forwarder - translates position reports to Cursor-on-Target
 # ============================================================================
@@ -202,6 +230,16 @@ class TAKForwarder:
         self.emergency = config.get('tak_emergency', True)
         self.emergency_stale_s = config.get('tak_emergency_stale', 300)
 
+        # Last-known persistence: radios stay on the map after they stop
+        # reporting (power-off, no coverage) and across bot restarts.
+        self.last_known = config.get('tak_last_known', True)
+        self.state_file = os.path.join(
+            config.get('cert_dir', '/app/certs'), 'tak_state.json')
+        self.track_dir = config.get('track_dir', '')
+        self.last_seen = {}         # radio_id -> ts of last live report
+        self.last_known_sent = {}   # radio_id -> ts of last re-broadcast
+        self._load_state()
+
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
         # (and renews) its own client certificate from the TAK server's
         # enrollment endpoint - no manual cert handling anywhere.
@@ -221,6 +259,48 @@ class TAKForwarder:
     @property
     def enabled(self):
         return bool(self.host)
+
+    def _load_state(self):
+        if not self.enabled:
+            return
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+            for rid, entry in state.items():
+                self.last_fix[rid] = entry['fix']
+                self.last_callsign[rid] = entry.get('callsign', rid)
+                self.last_seen[rid] = entry.get('ts', 0)
+            if state:
+                log.info("TAK: restored last-known positions: %s",
+                         ', '.join(sorted(state)))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("TAK: could not load state file: %s", e)
+
+    def _save_state(self):
+        try:
+            state = {rid: {'fix': self.last_fix[rid],
+                           'callsign': self.last_callsign.get(rid, rid),
+                           'ts': self.last_seen.get(rid, 0)}
+                     for rid in self.last_fix}
+            tmp = self.state_file + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(state, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            log.debug("TAK: state save failed: %s", e)
+
+    def _append_track(self, radio_id, fix):
+        if not self.track_dir:
+            return
+        try:
+            os.makedirs(self.track_dir, exist_ok=True)
+            path = os.path.join(self.track_dir, radio_id + '.jsonl')
+            with open(path, 'a') as f:
+                f.write(json.dumps({'ts': int(time.time()), **fix}) + '\n')
+        except Exception as e:
+            log.debug("track append failed: %s", e)
 
     def _cert_valid(self):
         """True if the enrolled client cert exists and is not near expiry."""
@@ -361,14 +441,20 @@ class TAKForwarder:
     def _cot_time(t):
         return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t)) + '.000Z'
 
-    def _build_event(self, uid, callsign, fix):
+    def _build_event(self, uid, callsign, fix, last_seen=None):
         now = time.time()
         ce = fix['accuracy'] if fix['accuracy'] is not None else 9999999.0
         callsign = (callsign.replace('&', '&amp;').replace('<', '&lt;')
                     .replace('>', '&gt;').replace('"', '&quot;'))
+        # A last-known re-broadcast is estimated ("h-e"), not measured,
+        # and carries when the radio was actually last heard.
+        remarks = ''
+        if last_seen:
+            remarks = ('<remarks>last known - radio last seen {}</remarks>'
+                       .format(self._cot_time(last_seen)))
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<event version="2.0" uid="{uid}" type="{typ}" how="m-g"'
+            '<event version="2.0" uid="{uid}" type="{typ}" how="{how}"'
             ' time="{t}" start="{t}" stale="{stale}">'
             '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="{alt:.1f}"'
             ' ce="{ce:.1f}" le="9999999.0"/>'
@@ -377,15 +463,18 @@ class TAKForwarder:
             '<__group name="{team}" role="{role}"/>'
             '<takv device="TE300K" platform="porto-watchdog" os="Android" version="1.1"/>'
             '<track speed="{speed:.1f}" course="{course:.1f}"/>'
+            '{remarks}'
             '</detail>'
             '</event>\n'
         ).format(
             uid=uid, typ=self.cot_type,
+            how='h-e' if last_seen else 'm-g',
             t=self._cot_time(now),
             stale=self._cot_time(now + self.stale_s),
             lat=fix['lat'], lon=fix['lon'], alt=fix['alt'], ce=ce,
             callsign=callsign, team=self.team, role=self.role,
             speed=fix['speed'], course=fix['course'],
+            remarks=remarks,
         )
 
     def _build_emergency(self, uid, callsign, fix):
@@ -465,6 +554,9 @@ class TAKForwarder:
             return
         self.last_fix[radio_id] = fix
         self.last_callsign[radio_id] = callsign
+        self.last_seen[radio_id] = time.time()
+        self._save_state()
+        self._append_track(radio_id, fix)
         event = self._build_event('porto-' + radio_id, callsign, fix)
         self._transmit(event.encode('utf-8'))
 
@@ -474,6 +566,31 @@ class TAKForwarder:
                      radio_id, callsign, fix['lat'], fix['lon'])
         else:
             log.debug("TAK: %s %.5f %.5f", radio_id, fix['lat'], fix['lon'])
+
+    LAST_KNOWN_RESEND_S = 60
+    LAST_KNOWN_SILENCE_S = 90
+
+    def maintain(self):
+        """Keep silent radios on the map: once a radio has been quiet
+        for LAST_KNOWN_SILENCE_S, re-broadcast its last known position
+        every LAST_KNOWN_RESEND_S (marked how='h-e' with a last-seen
+        remark) so the marker never stales away - including right
+        after a bot restart, thanks to the persisted state file.
+        """
+        if not (self.enabled and self.last_known):
+            return
+        now = time.time()
+        for radio_id, fix in list(self.last_fix.items()):
+            if now - self.last_seen.get(radio_id, 0) < self.LAST_KNOWN_SILENCE_S:
+                continue
+            if now - self.last_known_sent.get(radio_id, 0) < self.LAST_KNOWN_RESEND_S:
+                continue
+            self.last_known_sent[radio_id] = now
+            callsign = self.last_callsign.get(radio_id, radio_id)
+            event = self._build_event('porto-' + radio_id, callsign, fix,
+                                      last_seen=self.last_seen.get(radio_id))
+            if self._transmit(event.encode('utf-8')):
+                log.debug("TAK: last-known re-broadcast for %s", radio_id)
 
     def send_emergency(self, radio_id):
         """Raise a 911 alert on the TAK map at the radio's last known
@@ -614,6 +731,8 @@ class ChannelBot:
         self.channel_mgr = None
         self.last_switch = {}  # per-radio debounce
         self.debounce_ms = 200
+        self.udp_sock = None
+        self.last_addr = {}    # radio_id -> last seen UDP source address
 
         self.radio_map = config['radios']
         self.allowed_ips = set()
@@ -700,6 +819,8 @@ class ChannelBot:
                     )
                     log.info("[%s] Radio connected: %s", radio_id, msg)
                     self.mumble.users[user['session']].send_text_message(msg)
+                    self.send_channel_update(radio_id,
+                                             override_name=channel_name)
                     break
         except Exception as e:
             log.warning("Failed to send connect message: %s", e)
@@ -742,6 +863,34 @@ class ChannelBot:
         except Exception as e:
             log.error("broadcast failed: %s", e)
 
+    def send_channel_update(self, radio_id, addr=None, override_name=None):
+        """Send a signed 'C' packet with the radio's current Mumble
+        channel back over UDP (to the source address of its last
+        packet), so the radio's screen can show it. Empty name means
+        the radio's user is not connected to Mumble.
+        """
+        addr = addr or self.last_addr.get(radio_id)
+        if self.udp_sock is None or addr is None:
+            return
+        secret = get_secret_for_radio(self.config, radio_id)
+        if secret is None:
+            return
+        name = override_name
+        if name is None:
+            name = ''
+            username = self.radio_map.get(radio_id)
+            if username and self.channel_mgr:
+                user = self.channel_mgr.find_user_by_name(username)
+                if user:
+                    channel = self.mumble.channels.get(user['channel_id'])
+                    if channel:
+                        name = channel['name']
+        try:
+            self.udp_sock.sendto(
+                build_channel_packet(radio_id, name, secret), addr)
+        except Exception as e:
+            log.debug("channel update to %s failed: %s", radio_id, e)
+
     def handle_packet(self, data, addr):
         # IP allowlist
         if self.allowed_ips and addr[0] not in self.allowed_ips:
@@ -752,14 +901,22 @@ class ChannelBot:
         if cmd is None:
             return
 
+        self.last_addr[radio_id] = addr
+
         # Per-radio debounce - key presses only; 'L' position reports
-        # arrive on their own schedule and must not consume the window
+        # and 'H' heartbeats arrive on their own schedule and must not
+        # consume the window
         if cmd in KEY_COMMANDS:
             now = time.time() * 1000
             last = self.last_switch.get(radio_id, 0)
             if now - last < self.debounce_ms:
                 return
             self.last_switch[radio_id] = now
+
+        # Every valid packet gets a 'C' reply so the radio's screen
+        # tracks its channel/connection state; N/P override with the
+        # switch target because pymumble's local state lags the move.
+        channel_override = None
 
         if cmd == 'L':
             if radio_id not in self.radio_map:
@@ -777,6 +934,7 @@ class ChannelBot:
             name, cid = self.channel_mgr.switch(radio_id, direction)
             if name:
                 self.announce(radio_id, name, cid)
+                channel_override = name
         elif cmd == 'E':
             fmt = self.config['emergency_format']
             username = self.radio_map.get(radio_id, radio_id)
@@ -794,6 +952,13 @@ class ChannelBot:
             actual_name = user['name'] if user else username
             msg = fmt.format(username=actual_name)
             self.broadcast_to_channel(radio_id, msg)
+        elif cmd == 'H':
+            # Heartbeat: nothing to do beyond the 'C' reply below. Sent
+            # by the radio every minute; doubles as the NAT keepalive
+            # that lets our replies reach it on cellular.
+            log.debug("[%s] heartbeat", radio_id)
+
+        self.send_channel_update(radio_id, addr, channel_override)
 
     def run(self):
         self.running = True
@@ -846,10 +1011,20 @@ class ChannelBot:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((listen_addr, listen_port))
         sock.settimeout(1.0)
+        self.udp_sock = sock
 
         log.info("Listening on UDP %s:%d (HMAC-SHA256, replay window=%ds)",
                  listen_addr, listen_port, REPLAY_WINDOW)
-        log.info("Commands: N(ext) P(rev) E(mergency) I(dent)")
+        log.info("Commands: N(ext) P(rev) E(mergency) I(dent) H(eartbeat)")
+        log.info("Channel feedback: replying 'C' packets (radio screens)")
+        if self.tak.enabled and self.tak.last_known:
+            log.info("TAK last-known: silent radios re-broadcast every %ds"
+                     " (state: %s)", self.tak.LAST_KNOWN_RESEND_S,
+                     self.tak.state_file)
+        if self.tak.enabled and self.tak.track_dir:
+            log.info("Track history: %s (export:"
+                     " --export-gpx <radio> [YYYY-MM-DD])",
+                     self.tak.track_dir)
         log.info("Ready!")
 
         try:
@@ -857,6 +1032,7 @@ class ChannelBot:
                 try:
                     data, addr = sock.recvfrom(128)
                 except socket.timeout:
+                    self.tak.maintain()
                     continue
                 self.handle_packet(data, addr)
         except KeyboardInterrupt:
@@ -922,6 +1098,9 @@ def load_env_config():
         'tak_key_pass': os.environ.get('TAK_KEY_PASS', ''),
         'tak_emergency': env_bool('TAK_EMERGENCY', 'true'),
         'tak_emergency_stale': int(os.environ.get('TAK_EMERGENCY_STALE', '300')),
+        'tak_last_known': env_bool('TAK_LAST_KNOWN', 'true'),
+        'track_dir': (os.environ.get('TRACK_DIR', '/app/certs/tracks')
+                      if env_bool('TRACK_HISTORY', 'true') else ''),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
         'tak_stale': int(os.environ.get('TAK_STALE', '300')),
         'tak_team': os.environ.get('TAK_TEAM', 'Cyan'),
@@ -971,6 +1150,36 @@ def load_env_config():
     return config
 
 
+def export_gpx(track_dir, radio_id, day=None):
+    """Print a GPX track built from the radio's history log.
+    day: optional 'YYYY-MM-DD' (UTC) filter.
+    """
+    path = os.path.join(track_dir, radio_id + '.jsonl')
+    points = []
+    with open(path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if day and time.strftime(
+                    '%Y-%m-%d', time.gmtime(entry['ts'])) != day:
+                continue
+            points.append(entry)
+    print('<?xml version="1.0" encoding="UTF-8"?>')
+    print('<gpx version="1.1" creator="porto-watchdog"'
+          ' xmlns="http://www.topografix.com/GPX/1/1">')
+    name = radio_id + (' ' + day if day else '')
+    print(f'<trk><name>{name}</name><trkseg>')
+    for e in points:
+        iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(e['ts']))
+        print(f'<trkpt lat="{e["lat"]:.7f}" lon="{e["lon"]:.7f}">'
+              f'<ele>{e.get("alt", 0)}</ele><time>{iso}</time></trkpt>')
+    print('</trkseg></trk></gpx>')
+    log_msg = f"{len(points)} points"
+    print(f'<!-- {log_msg} -->', file=sys.stderr)
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Porto Watchdog - remote radio control')
@@ -978,7 +1187,16 @@ def main():
                    help='List channels/users and exit')
     p.add_argument('--gen-secret', action='store_true',
                    help='Generate a random secret and exit')
+    p.add_argument('--export-gpx', nargs='+', metavar=('RADIO', 'DATE'),
+                   help='Export a GPX track from the history log '
+                        '(radio_id, optional YYYY-MM-DD) and exit')
     args = p.parse_args()
+
+    if args.export_gpx:
+        track_dir = (os.environ.get('TRACK_DIR', '/app/certs/tracks'))
+        export_gpx(track_dir, args.export_gpx[0],
+                   args.export_gpx[1] if len(args.export_gpx) > 1 else None)
+        return
 
     if args.gen_secret:
         import secrets

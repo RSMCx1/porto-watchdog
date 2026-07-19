@@ -175,6 +175,37 @@ def parse_loc_packet(data, secret):
     }
 
 
+def read_track_points(track_dir, radio_id, t_from, t_to):
+    """Read (ts, lat, lon) tuples from the radio's history log,
+    filtered to [t_from, t_to). Malformed lines are skipped."""
+    path = os.path.join(track_dir, radio_id + '.jsonl')
+    points = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    ts = entry['ts']
+                except (ValueError, KeyError):
+                    continue
+                if t_from <= ts < t_to:
+                    points.append((ts, entry['lat'], entry['lon']))
+    except FileNotFoundError:
+        pass
+    return points
+
+
+def thin_points(points, max_n):
+    """Reduce a point list to at most max_n points by stride sampling,
+    always keeping the first and last."""
+    if len(points) <= max_n:
+        return points
+    stride = (len(points) - 1) / float(max_n - 1)
+    thinned = [points[round(i * stride)] for i in range(max_n - 1)]
+    thinned.append(points[-1])
+    return thinned
+
+
 def build_channel_packet(radio_id, channel_name, secret):
     """Server->radio 'C' packet carrying the radio's current Mumble
     channel name (empty = the radio's user is not on the server).
@@ -238,6 +269,12 @@ class TAKForwarder:
         self.track_dir = config.get('track_dir', '')
         self.last_seen = {}         # radio_id -> ts of last live report
         self.last_known_sent = {}   # radio_id -> ts of last re-broadcast
+        # Rolling trails drawn from the track history
+        self.trail = config.get('tak_trail', True)
+        self.trail_hours = config.get('tak_trail_hours', 6)
+        self._last_trail_publish = 0
+        # Active emergency alerts, cancellable via the ident button
+        self.active_emergency = {}  # radio_id -> alert expiry ts
         self._load_state()
 
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
@@ -567,6 +604,65 @@ class TAKForwarder:
         else:
             log.debug("TAK: %s %.5f %.5f", radio_id, fix['lat'], fix['lon'])
 
+    TRAIL_REFRESH_S = 300
+    TRAIL_MAX_POINTS = 300
+
+    def _build_trail_event(self, uid, callsign, points, stale_s):
+        """Polyline drawing (u-d-f) tracing the given (ts, lat, lon)
+        points - shows up on the map as a named line under the radio's
+        marker."""
+        now = time.time()
+        callsign = (callsign.replace('&', '&amp;').replace('<', '&lt;')
+                    .replace('>', '&gt;').replace('"', '&quot;'))
+        links = ''.join(
+            '<link point="{:.7f},{:.7f}"/>'.format(lat, lon)
+            for _, lat, lon in points)
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="{uid}" type="u-d-f" how="h-e"'
+            ' time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="0.0"'
+            ' ce="9999999.0" le="9999999.0"/>'
+            '<detail>'
+            '<contact callsign="{callsign}"/>'
+            '<strokeColor value="-16711681"/>'
+            '<strokeWeight value="3"/>'
+            '<fillColor value="0"/>'
+            '<labels_on value="true"/>'
+            '{links}'
+            '</detail>'
+            '</event>\n'
+        ).format(
+            uid=uid, t=self._cot_time(now),
+            stale=self._cot_time(now + stale_s),
+            lat=points[-1][1], lon=points[-1][2],
+            callsign=callsign, links=links,
+        )
+
+    def publish_trail(self, radio_id, points, name_suffix='trail',
+                      stale_s=None):
+        """Send a trail polyline for the given points (at least 2).
+        Returns True when transmitted."""
+        if len(points) < 2:
+            return False
+        points = thin_points(points, self.TRAIL_MAX_POINTS)
+        callsign = self.last_callsign.get(radio_id, radio_id)
+        uid = 'porto-{}-{}'.format(radio_id, name_suffix.replace(' ', '-'))
+        event = self._build_trail_event(
+            uid, '{} {}'.format(callsign, name_suffix), points,
+            stale_s if stale_s else self.TRAIL_REFRESH_S * 3)
+        return self._transmit(event.encode('utf-8'))
+
+    def _publish_rolling_trails(self):
+        now = time.time()
+        for radio_id in list(self.last_fix):
+            points = read_track_points(
+                self.track_dir, radio_id,
+                now - self.trail_hours * 3600, now + 1)
+            if self.publish_trail(radio_id, points):
+                log.debug("TAK: trail refreshed for %s (%d points)",
+                          radio_id, len(points))
+
     LAST_KNOWN_RESEND_S = 60
     LAST_KNOWN_SILENCE_S = 90
 
@@ -577,9 +673,15 @@ class TAKForwarder:
         remark) so the marker never stales away - including right
         after a bot restart, thanks to the persisted state file.
         """
-        if not (self.enabled and self.last_known):
+        if not self.enabled:
             return
         now = time.time()
+        if (self.trail and self.track_dir
+                and now - self._last_trail_publish >= self.TRAIL_REFRESH_S):
+            self._last_trail_publish = now
+            self._publish_rolling_trails()
+        if not self.last_known:
+            return
         for radio_id, fix in list(self.last_fix.items()):
             if now - self.last_seen.get(radio_id, 0) < self.LAST_KNOWN_SILENCE_S:
                 continue
@@ -607,7 +709,47 @@ class TAKForwarder:
         callsign = self.last_callsign.get(radio_id, radio_id)
         event = self._build_emergency('porto-' + radio_id, callsign, fix)
         if self._transmit(event.encode('utf-8')):
+            self.active_emergency[radio_id] = time.time() + self.emergency_stale_s
             log.warning("TAK: emergency alert raised for %s (%s)",
+                        radio_id, callsign)
+
+    def cancel_emergency(self, radio_id):
+        """Withdraw the radio's active 911 alert (b-a-o-can) - wired to
+        the ident button. No-op when there is no unexpired alert.
+        """
+        if not (self.enabled and self.emergency):
+            return
+        if self.active_emergency.get(radio_id, 0) < time.time():
+            self.active_emergency.pop(radio_id, None)
+            return
+        fix = self.last_fix.get(radio_id)
+        if fix is None:
+            return
+        callsign = self.last_callsign.get(radio_id, radio_id)
+        safe = (callsign.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;').replace('"', '&quot;'))
+        now = time.time()
+        uid = 'porto-' + radio_id
+        event = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="{uid}-9-1-1" type="b-a-o-can"'
+            ' how="m-g" time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="{lat:.7f}" lon="{lon:.7f}" hae="{alt:.1f}"'
+            ' ce="9999999.0" le="9999999.0"/>'
+            '<detail>'
+            '<emergency cancel="true">{callsign}-Alert</emergency>'
+            '<link uid="{uid}" type="{typ}" relation="p-p"/>'
+            '</detail>'
+            '</event>\n'
+        ).format(
+            uid=uid, typ=self.cot_type,
+            t=self._cot_time(now), stale=self._cot_time(now + 60),
+            lat=fix['lat'], lon=fix['lon'], alt=fix['alt'],
+            callsign=safe,
+        )
+        if self._transmit(event.encode('utf-8')):
+            self.active_emergency.pop(radio_id, None)
+            log.warning("TAK: emergency alert cancelled for %s (%s)",
                         radio_id, callsign)
 
     def close(self):
@@ -952,6 +1094,7 @@ class ChannelBot:
             actual_name = user['name'] if user else username
             msg = fmt.format(username=actual_name)
             self.broadcast_to_channel(radio_id, msg)
+            self.tak.cancel_emergency(radio_id)
         elif cmd == 'H':
             # Heartbeat: nothing to do beyond the 'C' reply below. Sent
             # by the radio every minute; doubles as the NAT keepalive
@@ -1025,6 +1168,11 @@ class ChannelBot:
             log.info("Track history: %s (export:"
                      " --export-gpx <radio> [YYYY-MM-DD])",
                      self.tak.track_dir)
+            if self.tak.trail:
+                log.info("Rolling trails: last %.1fh on the map,"
+                         " refreshed every %ds (dated trails:"
+                         " --publish-trail <radio> [YYYY-MM-DD [END]])",
+                         self.tak.trail_hours, self.tak.TRAIL_REFRESH_S)
         log.info("Ready!")
 
         try:
@@ -1099,6 +1247,8 @@ def load_env_config():
         'tak_emergency': env_bool('TAK_EMERGENCY', 'true'),
         'tak_emergency_stale': int(os.environ.get('TAK_EMERGENCY_STALE', '300')),
         'tak_last_known': env_bool('TAK_LAST_KNOWN', 'true'),
+        'tak_trail': env_bool('TAK_TRAIL', 'true'),
+        'tak_trail_hours': float(os.environ.get('TAK_TRAIL_HOURS', '6')),
         'track_dir': (os.environ.get('TRACK_DIR', '/app/certs/tracks')
                       if env_bool('TRACK_HISTORY', 'true') else ''),
         'tak_cot_type': os.environ.get('TAK_COT_TYPE', 'a-f-G-U-C'),
@@ -1180,6 +1330,32 @@ def export_gpx(track_dir, radio_id, day=None):
     print(f'<!-- {log_msg} -->', file=sys.stderr)
 
 
+def publish_dated_trail(config, radio_id, day, day_end=None, ttl_min=60):
+    """Publish a date-range trail to the TAK server as its own named
+    polyline (e.g. "P1 2026-07-20"), auto-expiring after ttl_min."""
+    import calendar
+    t_from = calendar.timegm(time.strptime(day, '%Y-%m-%d'))
+    t_to = calendar.timegm(
+        time.strptime(day_end or day, '%Y-%m-%d')) + 86400
+    points = read_track_points(config['track_dir'], radio_id, t_from, t_to)
+    if len(points) < 2:
+        print(f"No track data for {radio_id} in {day}"
+              f"{'..' + day_end if day_end else ''}", file=sys.stderr)
+        return 1
+    fwd = TAKForwarder(config)
+    fwd.last_callsign.setdefault(
+        radio_id, config['tak_callsigns'].get(radio_id, radio_id))
+    name = day + ('..' + day_end if day_end else '')
+    ok = fwd.publish_trail(radio_id, points, name_suffix=name,
+                           stale_s=ttl_min * 60)
+    fwd.close()
+    print(f"{'Published' if ok else 'FAILED to publish'} trail "
+          f"'{fwd.last_callsign[radio_id]} {name}' "
+          f"({len(points)} points, visible {ttl_min} min)",
+          file=sys.stderr)
+    return 0 if ok else 1
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Porto Watchdog - remote radio control')
@@ -1190,6 +1366,13 @@ def main():
     p.add_argument('--export-gpx', nargs='+', metavar=('RADIO', 'DATE'),
                    help='Export a GPX track from the history log '
                         '(radio_id, optional YYYY-MM-DD) and exit')
+    p.add_argument('--publish-trail', nargs='+',
+                   metavar=('RADIO', 'DATE'),
+                   help='Publish a dated trail to the TAK map '
+                        '(radio_id, YYYY-MM-DD, optional end date) and exit')
+    p.add_argument('--trail-ttl', type=int, default=60, metavar='MIN',
+                   help='Minutes a published dated trail stays on the '
+                        'map (default 60)')
     args = p.parse_args()
 
     if args.export_gpx:
@@ -1197,6 +1380,19 @@ def main():
         export_gpx(track_dir, args.export_gpx[0],
                    args.export_gpx[1] if len(args.export_gpx) > 1 else None)
         return
+
+    if args.publish_trail:
+        if len(args.publish_trail) < 2:
+            print("--publish-trail needs RADIO and DATE (YYYY-MM-DD)",
+                  file=sys.stderr)
+            sys.exit(2)
+        logging.basicConfig(level=logging.INFO,
+                            format='%(levelname)s %(message)s')
+        config = load_env_config()
+        sys.exit(publish_dated_trail(
+            config, args.publish_trail[0], args.publish_trail[1],
+            args.publish_trail[2] if len(args.publish_trail) > 2 else None,
+            args.trail_ttl))
 
     if args.gen_secret:
         import secrets

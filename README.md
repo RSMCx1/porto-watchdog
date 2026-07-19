@@ -20,7 +20,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
 - **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
 - **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default, coordinates encrypted in transit - and the bot can enroll its own TAK certificate, so there are no certificate files to manage
-- **Persistent map presence & track history** - radios that power off or lose coverage stay on the TAK map as "last known" markers (surviving server restarts too), and every position is logged server-side with one-command GPX export
+- **Persistent map presence & track history** - radios that power off or lose coverage stay on the TAK map as "last known" markers (surviving server restarts too), and every position is logged server-side with one-command GPX export and on-map trails: a rolling recent-hours line per radio, plus any past date or range published on demand
 - **Channel display on the radio** - the radio's idle screen can show the live Mumble channel name (or "Disconnected"), fed by the server over the same signed UDP link
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
@@ -50,7 +50,7 @@ Two watchdogs work together:
 | **RSM PTT** (speaker-mic) | F1 | Same as body PTT - hold to talk from the external speaker-mic |
 | **Knob clockwise** | F14 | Next channel - forwarded to remote watchdog, TTS announces |
 | **Knob counter-clockwise** | F13 | Previous channel - forwarded to remote watchdog |
-| **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name |
+| **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name; also cancels the radio's active TAK emergency alert |
 | **Emergency button** (body or RSM) | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
 | **GPS** (optional) | - | Position reports - encrypted, forwarded to the TAK server if configured |
 
@@ -505,10 +505,12 @@ Notes:
   GPS triggers an emergency, the bot raises a 911 alert
   (`b-a-o-tbl`) at the radio's last reported position - it alarms on
   every connected ATAK/WinTAK client and clears itself after
-  `TAK_EMERGENCY_STALE` seconds (default 300). On by default whenever
-  TAK forwarding is on; set `TAK_EMERGENCY: "false"` to keep
-  emergencies Mumble-only. Radios that never sent a position are
-  skipped (no position to alert at).
+  `TAK_EMERGENCY_STALE` seconds (default 300). Pressing the **ident
+  button cancels the radio's active alert immediately** (a proper TAK
+  cancel, cleared on every client at once) - the voice ident still
+  happens as usual. On by default whenever TAK forwarding is on; set
+  `TAK_EMERGENCY: "false"` to keep emergencies Mumble-only. Radios
+  that never sent a position are skipped (no position to alert at).
 - **Radios never vanish from the map**: when a radio goes silent
   (powered off, out of coverage), the server keeps re-broadcasting
   its last known position every 60 seconds, marked "last known" with
@@ -522,6 +524,18 @@ Notes:
   docker exec porto-watchdog python channel_bot.py --export-gpx radio01 2026-07-20 > trip.gpx
   ```
   Roughly 300 KB per radio per day at a 30s interval.
+- **Trails on the map**: each radio drags a named line ("P1 trail")
+  showing where it has been - the last `TAK_TRAIL_HOURS` (default 6)
+  of its track, redrawn every 5 minutes so the map never accumulates
+  a forever-trail. `TAK_TRAIL: "false"` disables. For longer history,
+  publish any day or date range on demand as its own auto-expiring
+  line:
+  ```bash
+  docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-20
+  docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-18 2026-07-22 --trail-ttl 120
+  ```
+  It appears on every client as "P1 2026-07-20" and clears itself
+  after `--trail-ttl` minutes (default 60).
 - First GPS fix after power-on can take a couple of minutes cold.
 
 ## Channel Display on the Radio Screen (optional)
@@ -638,6 +652,8 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `TAK_EMERGENCY` | true | Raise a TAK 911 alert when a radio triggers an emergency |
 | `TAK_EMERGENCY_STALE` | 300 | Seconds until an emergency alert clears in ATAK |
 | `TAK_LAST_KNOWN` | true | Keep silent radios on the map at their last known position |
+| `TAK_TRAIL` | true | Draw a rolling trail line per radio on the map |
+| `TAK_TRAIL_HOURS` | 6 | Hours of track shown in the rolling trail |
 | `TRACK_HISTORY` | true | Log every position to a per-radio history file |
 | `TRACK_DIR` | /app/certs/tracks | Where position history is stored |
 | `TAK_TEAM` | Cyan | ATAK team color |

@@ -69,6 +69,8 @@ services:
       # TAK_EMERGENCY: "true"            # emergency button raises a TAK 911 alert
       # TAK_EMERGENCY_STALE: "300"       # seconds until the alert self-clears
       # TAK_LAST_KNOWN: "true"           # silent radios stay on the map (last known)
+      # TAK_TRAIL: "true"                # rolling trail line per radio on the map
+      # TAK_TRAIL_HOURS: "6"             # hours of track in the rolling trail
       # TRACK_HISTORY: "true"            # log positions; export via --export-gpx
       # TAK_TEAM: "Cyan"                 # ATAK team color
       # TAK_ROLE: "Team Member"          # ATAK role

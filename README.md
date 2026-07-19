@@ -11,7 +11,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 ## Features
 
 - **Push-to-talk** - press the physical PTT button on the radio and your voice goes out instantly, even with the app running in the background. No screen interaction needed
-- **Speaker-mic (RSM) support** - plug in a remote speaker microphone and its PTT button works exactly like the body PTT button
+- **Speaker-mic (RSM) support** - plug in a remote speaker microphone and its PTT and emergency buttons work exactly like the radio's own
 - **Channel knob** - turn the knob on the radio to switch between channels, just like a traditional two-way radio
 - **Voice announcements** - the radio speaks the channel name out loud every time you switch, so you always know where you are without looking at the screen
 - **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker; with TAK enabled, a 911 alert also pops up on every ATAK/WinTAK map at the radio's last known position
@@ -48,7 +48,7 @@ Two watchdogs work together:
 | **Knob clockwise** | F14 | Next channel - forwarded to remote watchdog, TTS announces |
 | **Knob counter-clockwise** | F13 | Previous channel - forwarded to remote watchdog |
 | **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name |
-| **Emergency button** | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
+| **Emergency button** (body or RSM) | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
 | **GPS** (optional) | - | Position reports - encrypted, forwarded to the TAK server if configured |
 
 ### Architecture

@@ -10,7 +10,9 @@
  *
  *   REMOTE (UDP → porto-watchdog server container):
  *     /dev/input/event3  KEY_F2 (60)  = Ident broadcast
- *     /dev/input/event3  KEY_F3 (61)  = Emergency broadcast
+ *     /dev/input/event3  KEY_F3 (61)  = Emergency broadcast (the RSM's
+ *                        emergency button also surfaces here, NOT on
+ *                        event2 - verified on real hardware)
  *     /dev/input/event4  KEY_F13 (183) = Previous channel
  *     /dev/input/event4  KEY_F14 (184) = Next channel
  *     GPS fixes from pttbridge.apk (abstract socket "porto_loc")

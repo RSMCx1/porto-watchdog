@@ -420,10 +420,13 @@ Notes:
 - Position packets carry lat/lon, altitude, speed, course, and GPS
   accuracy, and are HMAC-signed and replay-protected like every other
   packet. A radio with no `loc.conf` never touches the GPS at all.
-- Position reports are authenticated but **not encrypted** in transit:
-  an observer on the network path can read coordinates (not voice -
-  that is encrypted by Mumble). Payload encryption is on the roadmap;
-  until then, treat position privacy accordingly.
+- Coordinates are **encrypted in transit**: the position block of
+  every report is encrypted with a key derived from the radio's
+  existing secret, with a fresh random nonce per packet
+  (encrypt-then-MAC). An observer on the network path sees that a
+  radio reported, but not where it is. No extra keys to generate or
+  distribute - it all derives from the `secret=` already in
+  `knob.conf`.
 - First GPS fix after power-on can take a couple of minutes cold.
 
 ## Adding More Radios
@@ -492,6 +495,7 @@ All key events forwarded to the remote watchdog are authenticated.
 | Layer | How |
 |-------|-----|
 | Authentication | Every UDP packet signed with HMAC-SHA256 |
+| Position privacy | GPS coordinates encrypted per packet (encrypt-then-MAC, keys derived from the radio secret, random nonce) |
 | Per-radio keys | Optional per-radio secrets via `SECRETS` env var |
 | Replay protection | Packets expire after 30 seconds |
 | IP allowlist | Optional `ALLOWED_IPS` env var |

@@ -30,17 +30,28 @@
  *   [9..12]  timestamp: uint32 big-endian (unix epoch)
  *   [13..44] HMAC-SHA256 over bytes [0..12]
  *
- * Location packet format (60 bytes, HMAC-SHA256 signed):
+ * Location packet format (64 bytes, encrypted + HMAC-SHA256 signed):
  *   [0]      command: 'L'
  *   [1..8]   radio_id: 8-char identifier (null-padded)
  *   [9..12]  timestamp: uint32 big-endian (unix epoch)
- *   [13..16] latitude:  int32 big-endian, degrees * 1e7
- *   [17..20] longitude: int32 big-endian, degrees * 1e7
- *   [21..22] altitude:  int16 big-endian, meters
- *   [23..24] speed:     uint16 big-endian, 0.1 m/s units
- *   [25..26] course:    uint16 big-endian, 0.1 degree units
- *   [27]     accuracy:  uint8, meters (255 = worse/unknown)
- *   [28..59] HMAC-SHA256 over bytes [0..27]
+ *   [13..16] salt: 4 random bytes (per-packet nonce component)
+ *   [17..31] position block, encrypted (see below). Plaintext layout:
+ *              [0..3]   latitude:  int32 BE, degrees * 1e7
+ *              [4..7]   longitude: int32 BE, degrees * 1e7
+ *              [8..9]   altitude:  int16 BE, meters
+ *              [10..11] speed:     uint16 BE, 0.1 m/s units
+ *              [12..13] course:    uint16 BE, 0.1 degree units
+ *              [14]     accuracy:  uint8, meters (255 = unknown)
+ *   [32..63] HMAC-SHA256 over bytes [0..31] (encrypt-then-MAC)
+ *
+ * Position encryption (radios roam public networks; coordinates must
+ * not be readable in transit): keystream = HMAC-SHA256(K_enc,
+ * bytes[0..16]) XORed over the position block, with
+ * K_enc = HMAC-SHA256(secret, "porto-loc-enc-v1"). The per-packet
+ * timestamp+salt make the keystream unique; the radio_id in the
+ * header separates keystreams between radios sharing one secret.
+ * Everything derives from the secret already in knob.conf - no
+ * extra keys to manage.
  *
  * Build: arm-linux-gnueabihf-gcc -static -o porto-watchdog knob_reader.c
  *
@@ -190,8 +201,11 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 #define PAYLOAD_LEN     13
 
 /* Location packet constants */
-#define LOC_PKT_SIZE    60
-#define LOC_PAYLOAD_LEN 28
+#define LOC_PKT_SIZE    64
+#define LOC_PAYLOAD_LEN 32     /* signed region: header + ciphertext */
+#define LOC_HDR_LEN     17     /* cmd + radio_id + timestamp + salt */
+#define LOC_CIPHER_LEN  15     /* encrypted position block */
+#define LOC_KDF_LABEL   "porto-loc-enc-v1"
 
 /* Command bytes (UDP) */
 #define CMD_NEXT        'N'
@@ -309,12 +323,45 @@ static int round_i32(double v) {
     return (int)(v >= 0 ? v + 0.5 : v - 0.5);
 }
 
-/* Build the 60-byte 'L' position packet (layout in the header comment) */
+/* Position-encryption key, derived once from the configured secret */
+static unsigned char loc_enc_key[32];
+static int loc_enc_key_ready = 0;
+
+static void ensure_loc_enc_key(void) {
+    if (loc_enc_key_ready) return;
+    hmac_sha256((const unsigned char *)cfg_secret, strlen(cfg_secret),
+                (const unsigned char *)LOC_KDF_LABEL, strlen(LOC_KDF_LABEL),
+                loc_enc_key);
+    loc_enc_key_ready = 1;
+}
+
+/* Fill 4 random salt bytes (per-packet nonce component) */
+static void loc_salt(unsigned char salt[4]) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        int n = read(fd, salt, 4);
+        close(fd);
+        if (n == 4) return;
+    }
+    /* last-resort fallback, not expected on Android/Linux */
+    {
+        long long t = now_ms() ^ ((long long)getpid() << 20);
+        salt[0] = t & 0xff; salt[1] = (t >> 8) & 0xff;
+        salt[2] = (t >> 16) & 0xff; salt[3] = (t >> 24) & 0xff;
+    }
+}
+
+/* Build the 64-byte 'L' position packet (layout in the header comment).
+ * The position block is encrypted (encrypt-then-MAC) so coordinates
+ * are not readable on public networks. */
 static void build_loc_packet(unsigned char pkt[LOC_PKT_SIZE],
                              double lat, double lon, double alt,
                              float speed, float course, float acc) {
     unsigned int ts;
     struct timespec now;
+    unsigned char plain[LOC_CIPHER_LEN];
+    unsigned char ks[32];
+    int i;
     int lat_i = round_i32(lat * 1e7);
     int lon_i = round_i32(lon * 1e7);
     int alt_i = round_i32(alt);
@@ -331,6 +378,7 @@ static void build_loc_packet(unsigned char pkt[LOC_PKT_SIZE],
     if (acc_i < 0)   acc_i = 0;
     if (acc_i > 255) acc_i = 255;
 
+    /* Header: cmd + radio_id + timestamp + salt (all authenticated) */
     pkt[0] = (unsigned char)CMD_LOC;
     memset(pkt + 1, 0, RADIO_ID_LEN);
     strncpy((char *)(pkt + 1), cfg_radio_id, RADIO_ID_LEN);
@@ -340,21 +388,33 @@ static void build_loc_packet(unsigned char pkt[LOC_PKT_SIZE],
     pkt[10] = (ts >> 16) & 0xff;
     pkt[11] = (ts >> 8)  & 0xff;
     pkt[12] = ts & 0xff;
-    pkt[13] = ((unsigned int)lat_i >> 24) & 0xff;
-    pkt[14] = ((unsigned int)lat_i >> 16) & 0xff;
-    pkt[15] = ((unsigned int)lat_i >> 8)  & 0xff;
-    pkt[16] = (unsigned int)lat_i & 0xff;
-    pkt[17] = ((unsigned int)lon_i >> 24) & 0xff;
-    pkt[18] = ((unsigned int)lon_i >> 16) & 0xff;
-    pkt[19] = ((unsigned int)lon_i >> 8)  & 0xff;
-    pkt[20] = (unsigned int)lon_i & 0xff;
-    pkt[21] = ((unsigned int)alt_i >> 8) & 0xff;
-    pkt[22] = (unsigned int)alt_i & 0xff;
-    pkt[23] = ((unsigned int)spd_i >> 8) & 0xff;
-    pkt[24] = (unsigned int)spd_i & 0xff;
-    pkt[25] = ((unsigned int)crs_i >> 8) & 0xff;
-    pkt[26] = (unsigned int)crs_i & 0xff;
-    pkt[27] = (unsigned char)acc_i;
+    loc_salt(pkt + 13);
+
+    /* Position block plaintext */
+    plain[0]  = ((unsigned int)lat_i >> 24) & 0xff;
+    plain[1]  = ((unsigned int)lat_i >> 16) & 0xff;
+    plain[2]  = ((unsigned int)lat_i >> 8)  & 0xff;
+    plain[3]  = (unsigned int)lat_i & 0xff;
+    plain[4]  = ((unsigned int)lon_i >> 24) & 0xff;
+    plain[5]  = ((unsigned int)lon_i >> 16) & 0xff;
+    plain[6]  = ((unsigned int)lon_i >> 8)  & 0xff;
+    plain[7]  = (unsigned int)lon_i & 0xff;
+    plain[8]  = ((unsigned int)alt_i >> 8) & 0xff;
+    plain[9]  = (unsigned int)alt_i & 0xff;
+    plain[10] = ((unsigned int)spd_i >> 8) & 0xff;
+    plain[11] = (unsigned int)spd_i & 0xff;
+    plain[12] = ((unsigned int)crs_i >> 8) & 0xff;
+    plain[13] = (unsigned int)crs_i & 0xff;
+    plain[14] = (unsigned char)acc_i;
+
+    /* Encrypt: keystream = HMAC-SHA256(K_enc, header), unique per
+     * packet via timestamp+salt (and radio_id for shared secrets) */
+    ensure_loc_enc_key();
+    hmac_sha256(loc_enc_key, 32, pkt, LOC_HDR_LEN, ks);
+    for (i = 0; i < LOC_CIPHER_LEN; i++)
+        pkt[LOC_HDR_LEN + i] = plain[i] ^ ks[i];
+
+    /* MAC over header + ciphertext (encrypt-then-MAC) */
     hmac_sha256((const unsigned char *)cfg_secret, strlen(cfg_secret),
                 pkt, LOC_PAYLOAD_LEN, pkt + LOC_PAYLOAD_LEN);
 }

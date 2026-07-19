@@ -51,10 +51,26 @@ PAYLOAD_LEN = 13   # cmd(1) + radio_id(8) + timestamp(4)
 HMAC_OFFSET = 13
 HMAC_LEN = 32
 
-# Location packet ('L'): payload adds lat(4) lon(4) alt(2) speed(2)
-# course(2) accuracy(1) after the timestamp
-LOC_PKT_SIZE = 60
-LOC_PAYLOAD_LEN = 28
+# Location packet ('L'): header (cmd + radio_id + timestamp + salt),
+# then an encrypted 15-byte position block, then the HMAC trailer.
+# Coordinates are encrypted because radios roam public networks -
+# see parse_loc_packet. Keys derive from the existing radio secret.
+LOC_PKT_SIZE = 64
+LOC_PAYLOAD_LEN = 32   # signed region: header + ciphertext
+LOC_HDR_LEN = 17       # cmd(1) + radio_id(8) + timestamp(4) + salt(4)
+LOC_KDF_LABEL = b'porto-loc-enc-v1'
+
+_loc_key_cache = {}
+
+
+def _loc_enc_key(secret):
+    """Position-encryption key derived from the radio's secret."""
+    key = _loc_key_cache.get(secret)
+    if key is None:
+        key = hmac.new(secret.encode('utf-8'), LOC_KDF_LABEL,
+                       hashlib.sha256).digest()
+        _loc_key_cache[secret] = key
+    return key
 
 # Replay window: reject packets older than this (seconds)
 REPLAY_WINDOW = 30
@@ -129,12 +145,21 @@ def verify_packet(data, config):
     return cmd, radio_id
 
 
-def parse_loc_packet(data):
-    """Parse the position fields of a verified 60-byte 'L' packet.
-    Returns dict with lat/lon (deg), alt (m), speed (m/s), course (deg),
-    accuracy (m, None if unknown).
+def parse_loc_packet(data, secret):
+    """Decrypt and parse the position block of a verified 'L' packet.
+
+    The block is encrypted with keystream = HMAC-SHA256(K_enc, header)
+    where K_enc = HMAC-SHA256(secret, "porto-loc-enc-v1") and the
+    header's timestamp+salt make each keystream unique (encrypt-then-
+    MAC; verify_packet has already checked the signature over the
+    ciphertext). Returns dict with lat/lon (deg), alt (m), speed
+    (m/s), course (deg), accuracy (m, None if unknown).
     """
-    lat, lon, alt, speed, course, acc = struct.unpack('>iihHHB', data[13:28])
+    keystream = hmac.new(_loc_enc_key(secret), data[:LOC_HDR_LEN],
+                         hashlib.sha256).digest()
+    cipher = data[LOC_HDR_LEN:LOC_PAYLOAD_LEN]
+    plain = bytes(c ^ k for c, k in zip(cipher, keystream))
+    lat, lon, alt, speed, course, acc = struct.unpack('>iihHHB', plain)
     return {
         'lat': lat / 1e7,
         'lon': lon / 1e7,
@@ -561,7 +586,8 @@ class ChannelBot:
             if radio_id not in self.radio_map:
                 log.warning("loc: unknown radio_id '%s'", radio_id)
                 return
-            fix = parse_loc_packet(data)
+            fix = parse_loc_packet(
+                data, get_secret_for_radio(self.config, radio_id))
             callsign = self.config['tak_callsigns'].get(radio_id)
             if not callsign:
                 mapped = self.radio_map[radio_id]

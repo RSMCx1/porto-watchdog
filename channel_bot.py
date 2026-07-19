@@ -275,6 +275,12 @@ class TAKForwarder:
         self._last_trail_publish = 0
         # Active emergency alerts, cancellable via the ident button
         self.active_emergency = {}  # radio_id -> alert expiry ts
+        # Chat command interface ("trail P1 [date [end]]" in TAK chat)
+        self.radio_map = config.get('radios', {})
+        self.callsign_map = config.get('tak_callsigns', {})
+        self._rx = b''
+        self._seen_chat = set()
+        self._processing = False
         self._load_state()
 
         # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
@@ -307,6 +313,8 @@ class TAKForwarder:
                 self.last_fix[rid] = entry['fix']
                 self.last_callsign[rid] = entry.get('callsign', rid)
                 self.last_seen[rid] = entry.get('ts', 0)
+                if entry.get('alert_until', 0) > time.time():
+                    self.active_emergency[rid] = entry['alert_until']
             if state:
                 log.info("TAK: restored last-known positions: %s",
                          ', '.join(sorted(state)))
@@ -319,7 +327,8 @@ class TAKForwarder:
         try:
             state = {rid: {'fix': self.last_fix[rid],
                            'callsign': self.last_callsign.get(rid, rid),
-                           'ts': self.last_seen.get(rid, 0)}
+                           'ts': self.last_seen.get(rid, 0),
+                           'alert_until': self.active_emergency.get(rid, 0)}
                      for rid in self.last_fix}
             tmp = self.state_file + '.tmp'
             with open(tmp, 'w') as f:
@@ -514,15 +523,18 @@ class TAKForwarder:
             remarks=remarks,
         )
 
-    def _build_emergency(self, uid, callsign, fix):
+    def _build_emergency(self, uid, callsign, fix, stale_s=None):
         """ATAK 911-alert event: type b-a-o-tbl, uid <base>-9-1-1, linked
         to the radio's own marker. Alarms on every connected TAK client
-        until it stales (emergency_stale_s).
+        until it stales (emergency_stale_s). stale_s=1 makes a
+        tombstone that purges the alert on clients that ignore cancels.
         """
         now = time.time()
         ce = fix['accuracy'] if fix['accuracy'] is not None else 9999999.0
         callsign = (callsign.replace('&', '&amp;').replace('<', '&lt;')
                     .replace('>', '&gt;').replace('"', '&quot;'))
+        if stale_s is None:
+            stale_s = self.emergency_stale_s
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<event version="2.0" uid="{uid}-9-1-1" type="b-a-o-tbl" how="m-g"'
@@ -538,7 +550,7 @@ class TAKForwarder:
         ).format(
             uid=uid, typ=self.cot_type,
             t=self._cot_time(now),
-            stale=self._cot_time(now + self.emergency_stale_s),
+            stale=self._cot_time(now + stale_s),
             lat=fix['lat'], lon=fix['lon'], alt=fix['alt'], ce=ce,
             callsign=callsign,
         )
@@ -556,8 +568,10 @@ class TAKForwarder:
             self.sock.setblocking(False)
             try:
                 while True:
-                    if not self.sock.recv(65536):
+                    data = self.sock.recv(65536)
+                    if not data:
                         raise ConnectionResetError("closed by TAK server")
+                    self._rx += data
             except (BlockingIOError, ssl.SSLWantReadError):
                 pass
             self.sock.settimeout(5)
@@ -568,6 +582,161 @@ class TAKForwarder:
             except Exception:
                 pass
             self.sock = None
+        self._process_inbound()
+
+    CHAT_FRESH_S = 120
+    CHAT_TRAIL_TTL_S = 3600
+    BOT_UID = 'porto-watchdog-bot'
+    BOT_CALLSIGN = 'porto-watchdog'
+
+    def _process_inbound(self):
+        """Scan the (previously discarded) SA feed for GeoChat commands
+        addressed to us; everything else is still thrown away."""
+        if self._processing:
+            return
+        self._processing = True
+        try:
+            if len(self._rx) > 262144:
+                self._rx = self._rx[-65536:]
+            while True:
+                end = self._rx.find(b'</event>')
+                if end < 0:
+                    break
+                start = self._rx.find(b'<event')
+                chunk = self._rx[start:end + 8] if 0 <= start < end else b''
+                self._rx = self._rx[end + 8:]
+                if chunk and b'b-t-f' in chunk and b'<remarks' in chunk:
+                    try:
+                        self._handle_chat(chunk.decode('utf-8', 'replace'))
+                    except Exception as e:
+                        log.debug("chat parse failed: %s", e)
+        finally:
+            self._processing = False
+
+    def _handle_chat(self, text):
+        import calendar
+        import xml.dom.minidom as minidom
+        ev = minidom.parseString(text).documentElement
+        if ev.getAttribute('type') != 'b-t-f':
+            return
+        uid = ev.getAttribute('uid')
+        if not uid or uid in self._seen_chat:
+            return
+        self._seen_chat.add(uid)
+        if len(self._seen_chat) > 1000:
+            self._seen_chat.clear()
+            self._seen_chat.add(uid)
+        try:
+            t = calendar.timegm(time.strptime(
+                ev.getAttribute('time').split('.')[0], '%Y-%m-%dT%H:%M:%S'))
+        except ValueError:
+            return
+        if abs(time.time() - t) > self.CHAT_FRESH_S:
+            return   # replayed history after a reconnect - not a live command
+        remarks = ev.getElementsByTagName('remarks')
+        if not remarks or not remarks[0].firstChild:
+            return
+        msg = remarks[0].firstChild.nodeValue.strip()
+        chats = ev.getElementsByTagName('__chat')
+        sender = chats[0].getAttribute('senderCallsign') if chats else ''
+        if sender == self.BOT_CALLSIGN:
+            return
+        words = msg.split()
+        if not words or words[0].lower() != 'trail':
+            return
+        log.info("TAK chat command: '%s' (from %s)", msg, sender or 'unknown')
+        self._chat_trail_command(words[1:])
+
+    def _resolve_radio(self, who):
+        """Match a chat argument against radio ids, TAK callsigns, and
+        Mumla usernames (case-insensitive)."""
+        w = who.lower()
+        for rid in self.radio_map:
+            if rid.lower() == w:
+                return rid
+        for rid, cs in self.callsign_map.items():
+            if str(cs).lower() == w:
+                return rid
+        for rid, cs in self.last_callsign.items():
+            if str(cs).lower() == w:
+                return rid
+        for rid, uname in self.radio_map.items():
+            if str(uname).lower() == w:
+                return rid
+        return None
+
+    def _chat_trail_command(self, args):
+        import calendar
+        if not args:
+            self.send_chat("usage: trail <radio> "
+                           "[YYYY-MM-DD|today|yesterday [end-date]]")
+            return
+        radio_id = self._resolve_radio(args[0])
+        if radio_id is None:
+            known = ', '.join(sorted(self.radio_map)) or 'none'
+            self.send_chat(f"unknown radio '{args[0]}' (known: {known})")
+            return
+
+        def day_ts(word):
+            w = word.lower()
+            today = int(time.time()) // 86400 * 86400
+            if w == 'today':
+                return today
+            if w == 'yesterday':
+                return today - 86400
+            return calendar.timegm(time.strptime(word, '%Y-%m-%d'))
+
+        try:
+            t_from = day_ts(args[1]) if len(args) > 1 else day_ts('today')
+            t_to = (day_ts(args[2]) if len(args) > 2 else t_from) + 86400
+        except ValueError:
+            self.send_chat("dates must be YYYY-MM-DD (or today/yesterday)")
+            return
+        if t_to <= t_from:
+            t_from, t_to = t_to - 86400, t_from + 86400
+        points = read_track_points(self.track_dir, radio_id, t_from, t_to)
+        label = time.strftime('%Y-%m-%d', time.gmtime(t_from))
+        if t_to - t_from > 86400:
+            label += '..' + time.strftime('%Y-%m-%d', time.gmtime(t_to - 86400))
+        if len(points) < 2:
+            self.send_chat(f"no track data for {radio_id} on {label}")
+            return
+        callsign = (self.callsign_map.get(radio_id)
+                    or self.last_callsign.get(radio_id, radio_id))
+        self.last_callsign[radio_id] = callsign
+        if self.publish_trail(radio_id, points, name_suffix=label,
+                              stale_s=self.CHAT_TRAIL_TTL_S):
+            self.send_chat(f"{callsign} {label}: {len(points)} points on "
+                           f"the map for {self.CHAT_TRAIL_TTL_S // 60} min")
+
+    def send_chat(self, text):
+        """GeoChat to All Chat Rooms - how the bot answers commands."""
+        now = time.time()
+        mid = '{:d}'.format(int(now * 1000))
+        safe = (text.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;').replace('"', '&quot;'))
+        event = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<event version="2.0" uid="GeoChat.{uid}.{mid}" type="b-t-f"'
+            ' how="h-g-i-g-o" time="{t}" start="{t}" stale="{stale}">'
+            '<point lat="0.0" lon="0.0" hae="0.0" ce="9999999.0"'
+            ' le="9999999.0"/>'
+            '<detail>'
+            '<__chat parent="RootContactGroup" groupOwner="false"'
+            ' messageId="{mid}" chatroom="All Chat Rooms"'
+            ' id="All Chat Rooms" senderCallsign="{cs}">'
+            '<chatgrp uid0="{uid}" uid1="All Chat Rooms"'
+            ' id="All Chat Rooms"/>'
+            '</__chat>'
+            '<link uid="{uid}" type="a-f-G" relation="p-p"/>'
+            '<remarks source="BAO.F.ATAK.{uid}" to="All Chat Rooms"'
+            ' time="{t}">{text}</remarks>'
+            '</detail>'
+            '</event>\n'
+        ).format(uid=self.BOT_UID, mid=mid, cs=self.BOT_CALLSIGN,
+                 t=self._cot_time(now), stale=self._cot_time(now + 300),
+                 text=safe)
+        self._transmit(event.encode('utf-8'))
 
     def _transmit(self, payload):
         for attempt in (1, 2):
@@ -710,6 +879,7 @@ class TAKForwarder:
         event = self._build_emergency('porto-' + radio_id, callsign, fix)
         if self._transmit(event.encode('utf-8')):
             self.active_emergency[radio_id] = time.time() + self.emergency_stale_s
+            self._save_state()
             log.warning("TAK: emergency alert raised for %s (%s)",
                         radio_id, callsign)
 
@@ -748,7 +918,12 @@ class TAKForwarder:
             callsign=safe,
         )
         if self._transmit(event.encode('utf-8')):
+            # tombstone: clients that ignore b-a-o-can drop the alert
+            # the moment its replacement is already stale
+            self._transmit(self._build_emergency(
+                uid, callsign, fix, stale_s=1).encode('utf-8'))
             self.active_emergency.pop(radio_id, None)
+            self._save_state()
             log.warning("TAK: emergency alert cancelled for %s (%s)",
                         radio_id, callsign)
 
@@ -1343,8 +1518,8 @@ def publish_dated_trail(config, radio_id, day, day_end=None, ttl_min=60):
               f"{'..' + day_end if day_end else ''}", file=sys.stderr)
         return 1
     fwd = TAKForwarder(config)
-    fwd.last_callsign.setdefault(
-        radio_id, config['tak_callsigns'].get(radio_id, radio_id))
+    fwd.last_callsign[radio_id] = (config['tak_callsigns'].get(radio_id)
+                                   or fwd.last_callsign.get(radio_id, radio_id))
     name = day + ('..' + day_end if day_end else '')
     ok = fwd.publish_trail(radio_id, points, name_suffix=name,
                            stale_s=ttl_min * 60)

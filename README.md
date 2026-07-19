@@ -20,7 +20,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
 - **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
 - **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default, coordinates encrypted in transit - and the bot can enroll its own TAK certificate, so there are no certificate files to manage
-- **Persistent map presence & track history** - radios that power off or lose coverage stay on the TAK map as "last known" markers (surviving server restarts too), and every position is logged server-side with one-command GPX export and on-map trails: a rolling recent-hours line per radio, plus any past date or range published on demand
+- **Persistent map presence & track history** - radios that power off or lose coverage stay on the TAK map as "last known" markers (surviving server restarts too), and every position is logged server-side with one-command GPX export and on-map trails: a rolling recent-hours line per radio, plus any past date or range on demand - just ask in TAK chat ("trail P1 yesterday")
 - **Channel display on the radio** - the radio's idle screen can show the live Mumble channel name (or "Disconnected"), fed by the server over the same signed UDP link
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
@@ -507,8 +507,9 @@ Notes:
   every connected ATAK/WinTAK client and clears itself after
   `TAK_EMERGENCY_STALE` seconds (default 300). Pressing the **ident
   button cancels the radio's active alert immediately** (a proper TAK
-  cancel, cleared on every client at once) - the voice ident still
-  happens as usual. On by default whenever TAK forwarding is on; set
+  cancel plus a force-stale tombstone for clients that ignore
+  cancels) - the voice ident still happens as usual, and active
+  alerts survive bot restarts. On by default whenever TAK forwarding is on; set
   `TAK_EMERGENCY: "false"` to keep emergencies Mumble-only. Radios
   that never sent a position are skipped (no position to alert at).
 - **Radios never vanish from the map**: when a radio goes silent
@@ -528,14 +529,18 @@ Notes:
   showing where it has been - the last `TAK_TRAIL_HOURS` (default 6)
   of its track, redrawn every 5 minutes so the map never accumulates
   a forever-trail. `TAK_TRAIL: "false"` disables. For longer history,
-  publish any day or date range on demand as its own auto-expiring
-  line:
+  ask for any day or date range on demand - **straight from TAK's
+  chat**: send `trail P1`, `trail P1 yesterday`, or
+  `trail P1 2026-07-18 2026-07-22` to All Chat Rooms (works in ATAK,
+  WinTAK and WebTAK; by radio id, callsign or username,
+  case-insensitive) and the bot draws the line and confirms in chat.
+  It appears on every client as "P1 2026-07-18..2026-07-22" and
+  auto-expires after an hour. The same is available from the server
+  CLI:
   ```bash
   docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-20
   docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-18 2026-07-22 --trail-ttl 120
   ```
-  It appears on every client as "P1 2026-07-20" and clears itself
-  after `--trail-ttl` minutes (default 60).
 - First GPS fix after power-on can take a couple of minutes cold.
 
 ## Channel Display on the Radio Screen (optional)

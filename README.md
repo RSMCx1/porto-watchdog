@@ -344,12 +344,36 @@ GPS fix -> pttbridge.apk -> porto-watchdog (local)
 The feature is **off by default** on both ends.
 
 **Server side** - point the remote watchdog at your TAK server.
-Two options:
+Three options:
 
-*Option A (recommended): certificate auth to the stock TLS input.*
-No new inputs needed - TAK's default 8089 input already requires a
-client certificate, which also stops anyone else on the network from
-reading the position feed or injecting fake markers.
+*Option A (recommended): self-enrollment.* The bot requests its own
+client certificate from the TAK server's enrollment API (port 8446 -
+the same mechanism ATAK phones use for Quick Connect) and re-enrolls
+automatically when the certificate is within 30 days of expiry. No
+certificate files to create, copy, or mount.
+
+1. Create an enrollment user on the TAK server (once):
+   ```bash
+   docker exec -it takserver bash -c \
+     "cd /opt/tak && java -jar utils/UserManager.jar usermod -p '<password>' porto"
+   ```
+   TAK enforces password complexity: minimum 15 characters with at
+   least one uppercase, one lowercase, one digit, and one special
+   character.
+2. Set on the porto-watchdog container:
+   ```yaml
+   TAK_HOST: your-tak-server
+   TAK_ENROLL_USER: "porto"
+   TAK_ENROLL_PASS: "<password>"
+   ```
+   That's all - enrollment implies TLS and defaults the port to the
+   stock 8089 input. The issued certificate is stored in the
+   `porto-certs` volume (already in the stock compose file), so it
+   survives restarts and the bot only talks to the enrollment API
+   when the certificate is missing or about to expire.
+
+*Option B: manual client certificate.* Same TLS input, but you issue
+and distribute the certificate yourself:
 
 1. Issue a client certificate on the TAK server (uses the CA you
    created during TAK setup):
@@ -373,7 +397,7 @@ reading the position feed or injecting fake markers.
    Client certs expire (makeCert.sh default ~2 years) - regenerate
    and swap the files when they do.
 
-*Option B: plain streaming input (trusted networks only).* Create an
+*Option C: plain streaming input (trusted networks only).* Create an
 input in the TAK web UI (**Configuration -> Input Manager -> Add
 Input**): protocol **STCP**, port `8087`, auth Anonymous, and set
 `TAK_HOST` + `TAK_PORT: "8087"` with `TAK_TLS: "false"`. Anyone who
@@ -476,8 +500,11 @@ RADIOS="radio01=P*"                            # any user starting with P
 | `LOG_LEVEL` | INFO | DEBUG, INFO, WARNING, ERROR |
 | `RADIOS` | *(required)* | Radio-to-user mapping |
 | `TAK_HOST` | *(empty=disabled)* | TAK server hostname/IP for GPS forwarding |
-| `TAK_PORT` | 8087 | TAK streaming input port |
-| `TAK_TLS` | false | Use TLS for the TAK connection |
+| `TAK_PORT` | 8087 / 8089 with TLS | TAK streaming input port |
+| `TAK_TLS` | false | Use TLS for the TAK connection (implied by enrollment) |
+| `TAK_ENROLL_USER` | *(empty)* | Enrollment username - enables certificate self-enrollment |
+| `TAK_ENROLL_PASS` | *(empty)* | Enrollment password |
+| `TAK_ENROLL_PORT` | 8446 | TAK certificate-enrollment API port |
 | `TAK_CA_FILE` | *(empty)* | CA cert for TLS (empty = no verification) |
 | `TAK_CERT_FILE` | *(empty)* | Client cert PEM for TLS client auth |
 | `TAK_KEY_FILE` | *(empty)* | Client key PEM for TLS client auth |

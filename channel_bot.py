@@ -180,6 +180,8 @@ class TAKForwarder:
 
     RECONNECT_MIN_S = 5
 
+    RENEW_BEFORE_S = 30 * 86400   # re-enroll when cert expires within 30 days
+
     def __init__(self, config):
         self.host = config['tak_host']
         self.port = config['tak_port']
@@ -196,15 +198,136 @@ class TAKForwarder:
         self.last_connect_attempt = 0
         self.seen_radios = set()
 
+        # Self-enrollment: with TAK_ENROLL_USER/PASS set, the bot obtains
+        # (and renews) its own client certificate from the TAK server's
+        # enrollment endpoint - no manual cert handling anywhere.
+        self.enroll_user = config.get('tak_enroll_user', '')
+        self.enroll_pass = config.get('tak_enroll_pass', '')
+        self.enroll_port = config.get('tak_enroll_port', 8446)
+        self.cert_dir = config.get('cert_dir', '/app/certs')
+        if self.enroll_user:
+            self.use_tls = True
+            if not self.cert_file:
+                self.cert_file = os.path.join(self.cert_dir, 'tak-client.pem')
+            if not self.key_file:
+                self.key_file = os.path.join(self.cert_dir, 'tak-client.key')
+            if not self.ca_file:
+                self.ca_file = os.path.join(self.cert_dir, 'tak-ca.pem')
+
     @property
     def enabled(self):
         return bool(self.host)
+
+    def _cert_valid(self):
+        """True if the enrolled client cert exists and is not near expiry."""
+        if not (os.path.exists(self.cert_file) and os.path.exists(self.key_file)):
+            return False
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['openssl', 'x509', '-checkend', str(self.RENEW_BEFORE_S),
+                 '-noout', '-in', self.cert_file],
+                capture_output=True, timeout=10)
+            return r.returncode == 0
+        except Exception as e:
+            log.warning("TAK: cert check failed: %s", e)
+            return os.path.exists(self.cert_file)
+
+    def _enroll(self):
+        """Obtain a client certificate from the TAK enrollment endpoint
+        (the same flow ATAK clients use): generate a keypair, fetch the
+        server's certificate-subject config, POST a CSR with basic auth,
+        store the signed cert + CA chain in cert_dir.
+        """
+        import json
+        import base64
+        import subprocess
+        import urllib.request
+        import xml.etree.ElementTree as ET
+
+        os.makedirs(self.cert_dir, exist_ok=True)
+        log.info("TAK: enrolling as '%s' via https://%s:%d ...",
+                 self.enroll_user, self.host, self.enroll_port)
+
+        subprocess.run(['openssl', 'genrsa', '-out', self.key_file, '2048'],
+                       check=True, capture_output=True, timeout=30)
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE   # trust-on-first-use; CA arrives with the cert
+        auth = base64.b64encode(
+            f'{self.enroll_user}:{self.enroll_pass}'.encode()).decode()
+        base = f'https://{self.host}:{self.enroll_port}'
+
+        # Subject: CN=<user> plus whatever the server's config dictates
+        subject = '/CN=' + self.enroll_user
+        try:
+            req = urllib.request.Request(
+                base + '/Marti/api/tls/config',
+                headers={'Authorization': 'Basic ' + auth})
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                root = ET.fromstring(r.read())
+            for entry in root.iter():
+                if entry.tag.endswith('nameEntry'):
+                    name, value = entry.get('name'), entry.get('value')
+                    if name and value:
+                        subject += f'/{name}={value}'
+        except Exception as e:
+            log.debug("TAK: tls/config not available (%s), using CN only", e)
+
+        csr = subprocess.run(
+            ['openssl', 'req', '-new', '-key', self.key_file,
+             '-subj', subject, '-outform', 'DER'],
+            check=True, capture_output=True, timeout=30).stdout
+
+        uid = 'porto-watchdog-' + self.enroll_user
+        req = urllib.request.Request(
+            f'{base}/Marti/api/tls/signClient/v2?clientUid={uid}&version=porto-watchdog',
+            data=base64.b64encode(csr),
+            method='POST',
+            headers={'Authorization': 'Basic ' + auth,
+                     'Content-Type': 'text/plain',
+                     'Accept': 'application/json'})
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+            resp = json.loads(r.read())
+
+        def as_pem(value):
+            if 'BEGIN CERTIFICATE' in value:
+                return value if value.endswith('\n') else value + '\n'
+            # TAK returns base64 with its own embedded newlines - strip all
+            # whitespace before wrapping or the re-wrap scrambles the base64
+            b64 = ''.join(value.split())
+            body = '\n'.join(b64[i:i + 64] for i in range(0, len(b64), 64))
+            return f'-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n'
+
+        with open(self.cert_file, 'w') as f:
+            f.write(as_pem(resp['signedCert']))
+        ca_keys = sorted(k for k in resp if k.startswith('ca'))
+        if ca_keys:
+            with open(self.ca_file, 'w') as f:
+                for k in ca_keys:
+                    f.write(as_pem(resp[k]))
+        log.info("TAK: enrolled - certificate stored in %s", self.cert_dir)
+
+    def _ensure_enrolled(self):
+        if not self.enroll_user:
+            return True
+        if self._cert_valid():
+            return True
+        try:
+            self._enroll()
+            return True
+        except Exception as e:
+            log.warning("TAK: enrollment failed: %s", e)
+            return False
 
     def _connect(self):
         now = time.time()
         if now - self.last_connect_attempt < self.RECONNECT_MIN_S:
             return False
         self.last_connect_attempt = now
+        if not self._ensure_enrolled():
+            return False
         try:
             sock = socket.create_connection((self.host, self.port), timeout=5)
             if self.use_tls:
@@ -651,6 +774,9 @@ class ChannelBot:
                      self.tak.host, self.tak.port,
                      "TLS" if self.tak.use_tls else "TCP",
                      self.tak.cot_type, self.tak.stale_s)
+            if self.tak.enroll_user:
+                log.info("TAK enrollment: user '%s' via port %d (auto-renews)",
+                         self.tak.enroll_user, self.tak.enroll_port)
         else:
             log.info("TAK forwarding: disabled (set TAK_HOST to enable)")
 
@@ -696,6 +822,13 @@ def load_env_config():
     def env_bool(key, default='true'):
         return os.environ.get(key, default).lower() in ('true', '1', 'yes')
 
+    # TAK connection defaults: self-enrollment implies TLS; TLS implies
+    # the stock 8089 input, plain implies the conventional 8087.
+    _tak_enroll_user = os.environ.get('TAK_ENROLL_USER', '').strip()
+    _tak_tls = env_bool('TAK_TLS', 'false') or bool(_tak_enroll_user)
+    _tak_port_str = os.environ.get('TAK_PORT', '').strip()
+    _tak_port = int(_tak_port_str) if _tak_port_str else (8089 if _tak_tls else 8087)
+
     config = {
         'mumble_host': os.environ.get('MUMBLE_HOST', '127.0.0.1'),
         'mumble_port': int(os.environ.get('MUMBLE_PORT', '64738')),
@@ -719,8 +852,11 @@ def load_env_config():
         'cert_dir': os.environ.get('CERT_DIR', '/app/certs'),
         # -- TAK forwarding (disabled unless TAK_HOST is set) --
         'tak_host': os.environ.get('TAK_HOST', '').strip(),
-        'tak_port': int(os.environ.get('TAK_PORT', '8087')),
-        'tak_tls': env_bool('TAK_TLS', 'false'),
+        'tak_port': _tak_port,
+        'tak_tls': _tak_tls,
+        'tak_enroll_user': _tak_enroll_user,
+        'tak_enroll_pass': os.environ.get('TAK_ENROLL_PASS', ''),
+        'tak_enroll_port': int(os.environ.get('TAK_ENROLL_PORT', '8446')),
         'tak_ca_file': os.environ.get('TAK_CA_FILE', '').strip(),
         'tak_cert_file': os.environ.get('TAK_CERT_FILE', '').strip(),
         'tak_key_file': os.environ.get('TAK_KEY_FILE', '').strip(),

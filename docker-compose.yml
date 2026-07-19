@@ -51,10 +51,14 @@ services:
       # -- GPS -> TAK forwarding (optional, disabled unless TAK_HOST set) --
       # Radios with GPS enabled (see README) report positions which are
       # forwarded to a TAK server as Cursor-on-Target events.
-      # Recommended: certificate auth against TAK's stock TLS input (8089).
+      # Recommended: self-enrollment - the bot fetches and renews its own
+      # client certificate from the TAK enrollment API (see README):
       # TAK_HOST: takserver              # TAK server hostname/IP
+      # TAK_ENROLL_USER: "porto"         # enrollment user (created once on TAK)
+      # TAK_ENROLL_PASS: "..."           # implies TLS + stock 8089 input
+      # Or bring your own certificate files (makeCert.sh flow, see README):
       # TAK_PORT: "8089"                 # 8089 = stock TLS input
-      # TAK_TLS: "true"                  # client-certificate auth (see README)
+      # TAK_TLS: "true"                  # client-certificate auth
       # TAK_CA_FILE: "/app/takcerts/ca.pem"
       # TAK_CERT_FILE: "/app/takcerts/porto-bot.pem"
       # TAK_KEY_FILE: "/app/takcerts/porto-bot.key"

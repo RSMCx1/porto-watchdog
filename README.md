@@ -25,6 +25,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
+- **Self-healing** - a watchdog on the radio checks every minute that Mumla and the local daemon are alive and relaunches whichever died. No adb cable needed in the field
 - **Server runs anywhere** - the server side runs as a Docker container with all settings configured through environment variables, making it easy to deploy on any machine or manage through Portainer
 
 ## How It Works
@@ -675,7 +676,7 @@ must be re-keyed.
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
 | `pttbridge/` | Source | Smali source for pttbridge.apk (build docs inside) |
-| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect + GPS reader |
+| `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect + GPS reader + self-healing watchdog |
 | `mumla.apk` | Radio | Mumla v3.6.15 - open-source Mumble client ([GPL-3.0](https://github.com/quite/mumla)) |
 
 Binaries are built automatically by CI - download `porto-watchdog` from
@@ -685,7 +686,8 @@ the [latest release](../../releases/latest) or the
 ## Troubleshooting
 
 - **Apps won't install** - `adb shell setprop persist.telo.install enable`
-- **PTT not working** - `adb shell dumpsys activity services | grep pttbridge`. If not running: `adb shell am startservice -a com.pttbridge.START`
+- **PTT not working** - `adb shell dumpsys activity services | grep pttbridge`. If not running: `adb shell am startservice -a com.pttbridge.START` (safe to repeat - since v1.2 the service is idempotent and only starts what is not already running)
+- **Mumla or the daemon died in the field** - since pttbridge v1.2 they relaunch automatically within ~2 minutes (watch `adb shell logcat -d | grep heal:` to see it happen). During a Mumla outage the radio's screen shows `Disconnected`, then recovers on its own
 - **Channel switch / emergency / ident not working** - check `knob.conf` on the radio: `host` must be reachable from the radio's network. Check UDP port 4378 is open. Check remote watchdog container logs: `docker logs porto-watchdog`
 - **"HMAC verification failed"** - `secret` in `knob.conf` must match the server's `SECRET` or that radio's entry in `SECRETS`
 - **"Replay rejected"** - radio clock is off. Check: `adb shell date`
@@ -703,4 +705,6 @@ the [latest release](../../releases/latest) or the
 ## Roadmap
 
 - **LED control** - adjust LED behavior based on external input and user preferences
-- **Home screen LCD** - replace the stock home screen with a custom display showing current channel, signal status, and radio info on the TE300K's small screen
+- **More on the idle screen** - the channel display (above) covered the
+  main wish; candidates for the remaining screen real estate: GPS fix
+  status, server link quality, battery-friendly dark mode

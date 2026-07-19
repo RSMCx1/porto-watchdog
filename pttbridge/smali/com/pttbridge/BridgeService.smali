@@ -15,35 +15,11 @@
     return-void
 .end method
 
-
-# virtual methods
-.method public onBind(Landroid/content/Intent;)Landroid/os/IBinder;
-    .locals 1
-
-    const/4 v0, 0x0
-
-    return-object v0
-.end method
-
-.method public onDestroy()V
-    .locals 1
-
-    iget-object v0, p0, Lcom/pttbridge/BridgeService;->mThread:Ljava/lang/Thread;
-
-    if-eqz v0, :cond_0
-
-    invoke-virtual {v0}, Ljava/lang/Thread;->interrupt()V
-
-    :cond_0
-    invoke-super {p0}, Landroid/app/Service;->onDestroy()V
-
-    return-void
-.end method
-
-.method public onStartCommand(Landroid/content/Intent;II)I
+# Launch the porto-watchdog daemon (idempotence is the caller's job -
+# check HealthRunner.isRunning first).
+.method public static launchDaemon()V
     .locals 4
 
-    # Launch the porto-watchdog binary in background with logging
     :try_start_exec
     invoke-static {}, Ljava/lang/Runtime;->getRuntime()Ljava/lang/Runtime;
 
@@ -76,8 +52,14 @@
     .catch Ljava/lang/Exception; {:try_start_exec .. :try_end_exec} :catch_exec
 
     :catch_exec
+    return-void
+.end method
 
-    # Launch Mumla and auto-connect to favorited server
+# Launch Mumla and inject the auto-connect keypresses (green button
+# twice after 8s, via the hardware input device).
+.method public static launchMumla(Landroid/content/Context;)V
+    .locals 4
+
     :try_start_mumla
     invoke-virtual {p0}, Landroid/content/Context;->getPackageManager()Landroid/content/pm/PackageManager;
 
@@ -102,8 +84,6 @@
     .catch Ljava/lang/Exception; {:try_start_mumla .. :try_end_mumla} :catch_mumla
 
     :catch_mumla
-
-    # Auto-connect: inject green button (KEY_ENTER) via hardware device, then HOME
     :try_start_autoconnect
     invoke-static {}, Ljava/lang/Runtime;->getRuntime()Ljava/lang/Runtime;
 
@@ -136,23 +116,101 @@
     .catch Ljava/lang/Exception; {:try_start_autoconnect .. :try_end_autoconnect} :catch_autoconnect
 
     :catch_autoconnect
+    return-void
+.end method
 
-    # Start HOME thread: sleep 15s then go to home screen (puts Mumla in background)
+
+# virtual methods
+.method public onBind(Landroid/content/Intent;)Landroid/os/IBinder;
+    .locals 1
+
+    const/4 v0, 0x0
+
+    return-object v0
+.end method
+
+.method public onDestroy()V
+    .locals 1
+
+    iget-object v0, p0, Lcom/pttbridge/BridgeService;->mThread:Ljava/lang/Thread;
+
+    if-eqz v0, :cond_0
+
+    invoke-virtual {v0}, Ljava/lang/Thread;->interrupt()V
+
+    :cond_0
+    invoke-super {p0}, Landroid/app/Service;->onDestroy()V
+
+    return-void
+.end method
+
+.method public onStartCommand(Landroid/content/Intent;II)I
+    .locals 3
+
+    # Daemon: only when not already running - repeated START intents
+    # (and the HealthRunner) must never spawn duplicates
+    const-string v0, "/data/local/tmp/ptt_bridge"
+
+    invoke-static {v0}, Lcom/pttbridge/HealthRunner;->isRunning(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-nez v0, :skip_daemon
+
+    invoke-static {}, Lcom/pttbridge/BridgeService;->launchDaemon()V
+
+    :skip_daemon
+    # Mumla: only when not already running; a fresh launch gets the
+    # auto-connect injection and the return-to-home thread
+    const-string v0, "se.lublin.mumla"
+
+    invoke-static {v0}, Lcom/pttbridge/HealthRunner;->isRunning(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-nez v0, :skip_mumla_start
+
+    invoke-static {p0}, Lcom/pttbridge/BridgeService;->launchMumla(Landroid/content/Context;)V
+
     new-instance v0, Ljava/lang/Thread;
+
     new-instance v1, Lcom/pttbridge/BridgeService$HomeRunner;
+
     invoke-direct {v1, p0}, Lcom/pttbridge/BridgeService$HomeRunner;-><init>(Lcom/pttbridge/BridgeService;)V
+
     invoke-direct {v0, v1}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V
+
     invoke-virtual {v0}, Ljava/lang/Thread;->start()V
 
-    # Start GPS reporter thread (no-op unless /data/local/tmp/loc.conf
-    # exists with an interval > 0 - see LocRunner)
+    :skip_mumla_start
+    # Long-lived threads: once per service instance
+    iget-object v0, p0, Lcom/pttbridge/BridgeService;->mThread:Ljava/lang/Thread;
+
+    if-nez v0, :skip_threads
+
+    # GPS reporter (no-op unless /data/local/tmp/loc.conf exists)
     new-instance v0, Ljava/lang/Thread;
+
     new-instance v1, Lcom/pttbridge/LocRunner;
+
     invoke-direct {v1, p0}, Lcom/pttbridge/LocRunner;-><init>(Landroid/content/Context;)V
+
     invoke-direct {v0, v1}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V
+
     invoke-virtual {v0}, Ljava/lang/Thread;->start()V
 
-    # Start the PTT socket thread
+    # Self-healing watchdog (relaunches Mumla/daemon if they die)
+    new-instance v0, Ljava/lang/Thread;
+
+    new-instance v1, Lcom/pttbridge/HealthRunner;
+
+    invoke-direct {v1, p0}, Lcom/pttbridge/HealthRunner;-><init>(Lcom/pttbridge/BridgeService;)V
+
+    invoke-direct {v0, v1}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V
+
+    invoke-virtual {v0}, Ljava/lang/Thread;->start()V
+
+    # PTT socket server
     new-instance v0, Lcom/pttbridge/BridgeService$SocketThread;
 
     invoke-direct {v0, p0}, Lcom/pttbridge/BridgeService$SocketThread;-><init>(Lcom/pttbridge/BridgeService;)V
@@ -161,6 +219,7 @@
 
     invoke-virtual {v0}, Ljava/lang/Thread;->start()V
 
+    :skip_threads
     const/4 v0, 0x1
 
     return v0

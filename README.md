@@ -752,6 +752,30 @@ Unsigned or expired packets are silently dropped.
    each device its own enrollment user - then the `User` column in
    the TAK certificate list is a per-device revocation handle.
 
+**Known tradeoffs (by design - read before deploying):**
+
+- **The radio is a single-purpose device.** `knob.conf` (with the
+  radio's secret) must be on-device readable for the daemon, and
+  `screenvars.txt` is on-device writable - any app installed on the
+  radio could read the one and spoof the other. Don't sideload
+  software you don't trust; the whole design assumes the radio runs
+  only what you put on it.
+- **Chat commands have no per-user authorization.** Anyone
+  authenticated to your TAK server can ask the bot for any radio's
+  trail - your TAK circle is the trust boundary. Don't hand out
+  enrollment accounts to people who shouldn't see location history.
+- **Replayed packets are accepted for up to 30 seconds** (the replay
+  window). The worst an on-path attacker gets is repeating an action
+  you just performed (an extra channel switch or duplicate alert) or
+  redirecting the next few signed screen updates - never forging new
+  commands or reading positions, which stay encrypted.
+- **Expose TAK's enrollment port (8446) only if devices must enroll
+  remotely** - it is password-authenticated, unlike the
+  certificate-gated streaming port. Enroll on the LAN when you can.
+- **Rotating a compromised `SECRET`/`SECRETS` entry requires
+  re-pushing `knob.conf`** to the remaining radios if you used a
+  shared secret - one more reason to prefer per-radio secrets.
+
 ## Files
 
 | File | Where | What |

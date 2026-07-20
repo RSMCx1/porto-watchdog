@@ -101,6 +101,26 @@ def get_secret_for_radio(config, radio_id):
     return None
 
 
+_log_throttle = {}
+
+
+def _throttled_warning(key, msg, *args):
+    """Rate-limit attacker-triggerable warnings (bad HMAC, replays,
+    unknown radios) to one per 10s per category, with a suppressed
+    count - otherwise a packet flood turns the log into its own DoS.
+    """
+    now = time.time()
+    last, suppressed = _log_throttle.get(key, (0.0, 0))
+    if now - last >= 10:
+        if suppressed:
+            msg += " (+%d similar suppressed)"
+            args = args + (suppressed,)
+        log.warning(msg, *args)
+        _log_throttle[key] = (now, 0)
+    else:
+        _log_throttle[key] = (last, suppressed + 1)
+
+
 def verify_packet(data, config):
     """Verify and parse a signed packet.
     Returns (command, radio_id) or (None, None) on failure.
@@ -118,7 +138,8 @@ def verify_packet(data, config):
 
     secret = get_secret_for_radio(config, radio_id)
     if secret is None:
-        log.warning("No secret configured for radio '%s'", radio_id)
+        _throttled_warning('nosecret',
+                           "No secret configured for radio '%s'", radio_id)
         return None, None
 
     payload = data[:payload_len]
@@ -131,7 +152,8 @@ def verify_packet(data, config):
     ).digest()
 
     if not hmac.compare_digest(received_hmac, expected_hmac):
-        log.warning("HMAC verification failed (radio=%s)", radio_id)
+        _throttled_warning('hmac',
+                           "HMAC verification failed (radio=%s)", radio_id)
         return None, None
 
     cmd = chr(data[0])
@@ -140,7 +162,9 @@ def verify_packet(data, config):
     now = int(time.time())
     age = abs(now - timestamp)
     if age > REPLAY_WINDOW:
-        log.warning("Replay rejected: packet age %ds (radio=%s)", age, radio_id)
+        _throttled_warning('replay',
+                           "Replay rejected: packet age %ds (radio=%s)",
+                           age, radio_id)
         return None, None
 
     if cmd not in VALID_COMMANDS:
@@ -330,6 +354,7 @@ class TAKForwarder:
         self.callsign_map = config.get('tak_callsigns', {})
         self._rx = b''
         self._seen_chat = set()
+        self._chat_cmd_times = []
         self._processing = False
         self._last_presence = 0
         self.bot_lat, self.bot_lon = 0.0, 0.0
@@ -648,6 +673,7 @@ class TAKForwarder:
 
     CHAT_FRESH_S = 120
     CHAT_TRAIL_TTL_S = 3600
+    CHAT_CMDS_PER_MIN = 6
     BOT_UID = 'porto-watchdog-bot'
     BOT_CALLSIGN = 'porto-watchdog'
     PRESENCE_S = 60
@@ -696,6 +722,11 @@ class TAKForwarder:
                 chunk = self._rx[start:end + 8] if 0 <= start < end else b''
                 self._rx = self._rx[end + 8:]
                 if chunk and b'b-t-f' in chunk and b'<remarks' in chunk:
+                    if b'<!' in chunk:
+                        # DOCTYPE/entity declarations never appear in
+                        # legitimate CoT - refuse to parse them
+                        # (entity-expansion hardening)
+                        continue
                     try:
                         self._handle_chat(chunk.decode('utf-8', 'replace'))
                     except Exception as e:
@@ -736,6 +767,15 @@ class TAKForwarder:
         words = msg.split()
         if not words or words[0].lower() != 'trail':
             return
+        now = time.time()
+        self._chat_cmd_times = [
+            t for t in self._chat_cmd_times if now - t < 60]
+        if len(self._chat_cmd_times) >= self.CHAT_CMDS_PER_MIN:
+            _throttled_warning(
+                'chatflood', "TAK chat: command rate limit hit"
+                " - ignoring '%s' from %s", msg, sender or 'unknown')
+            return
+        self._chat_cmd_times.append(now)
         log.info("TAK chat command: '%s' (from %s)", msg, sender or 'unknown')
         self._chat_trail_command(words[1:])
 
@@ -1336,7 +1376,9 @@ class ChannelBot:
     def handle_packet(self, data, addr):
         # IP allowlist
         if self.allowed_ips and addr[0] not in self.allowed_ips:
-            log.warning("Rejected packet from non-allowed IP: %s", addr[0])
+            _throttled_warning('badip',
+                               "Rejected packet from non-allowed IP: %s",
+                               addr[0])
             return
 
         cmd, radio_id = verify_packet(data, self.config)

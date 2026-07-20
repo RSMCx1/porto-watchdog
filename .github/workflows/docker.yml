@@ -58,6 +58,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          tags: |
-            rsmcx1/porto-watchdog:latest
-            rsmcx1/porto-watchdog:${{ github.sha }}
+          # Only main and release tags build, and both publish :latest
+          # (plus an immutable :sha). Feature branches never publish -
+          # production can only ever pull code that reached main.
+          tags: rsmcx1/porto-watchdog:latest,rsmcx1/porto-watchdog:${{ github.sha }}

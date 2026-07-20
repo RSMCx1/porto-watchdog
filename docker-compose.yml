@@ -10,7 +10,7 @@ services:
       - "4378:4378/udp"
     environment:
       # -- Mumble server --
-      MUMBLE_HOST: zip-mumble-server
+      MUMBLE_HOST: mumble-server
       MUMBLE_PORT: "64738"
       BOT_USERNAME: ChannelBot
       MUMBLE_SERVER_PASSWORD: ""
@@ -48,6 +48,34 @@ services:
       CONNECT_MESSAGE_ENABLED: "true"
       CONNECT_MESSAGE_FORMAT: "{username} {channel} connected"
 
+      # -- GPS -> TAK forwarding (optional, disabled unless TAK_HOST set) --
+      # Radios with GPS enabled (see README) report positions which are
+      # forwarded to a TAK server as Cursor-on-Target events.
+      # Recommended: self-enrollment - the bot fetches and renews its own
+      # client certificate from the TAK enrollment API (see README):
+      # TAK_HOST: takserver              # TAK server hostname/IP
+      # TAK_ENROLL_USER: "porto"         # enrollment user (created once on TAK)
+      # TAK_ENROLL_PASS: "..."           # implies TLS + stock 8089 input
+      # Or bring your own certificate files (makeCert.sh flow, see README):
+      # TAK_PORT: "8089"                 # 8089 = stock TLS input
+      # TAK_TLS: "true"                  # client-certificate auth
+      # TAK_CA_FILE: "/app/takcerts/ca.pem"
+      # TAK_CERT_FILE: "/app/takcerts/porto-bot.pem"
+      # TAK_KEY_FILE: "/app/takcerts/porto-bot.key"
+      # TAK_KEY_PASS: "atakatak"         # makeCert.sh default key password
+      # (plain alternative: STCP input on 8087, TAK_TLS "false" - LAN only)
+      # TAK_COT_TYPE: "a-f-G-U-C"        # CoT event type
+      # TAK_STALE: "300"                 # seconds until a marker goes stale
+      # TAK_EMERGENCY: "true"            # emergency button raises a TAK 911 alert
+      # TAK_EMERGENCY_STALE: "300"       # seconds until the alert self-clears
+      # TAK_LAST_KNOWN: "true"           # silent radios stay on the map (last known)
+      # TAK_TRAIL: "true"                # rolling trail line per radio on the map
+      # TAK_TRAIL_HOURS: "6"             # hours of track in the rolling trail
+      # TRACK_HISTORY: "true"            # log positions; export via --export-gpx
+      # TAK_TEAM: "Cyan"                 # ATAK team color
+      # TAK_ROLE: "Team Member"          # ATAK role
+      # TAK_CALLSIGNS: "radio01=Dad"     # per-radio callsign override
+
       # -- Logging --
       LOG_LEVEL: INFO
 
@@ -59,7 +87,12 @@ services:
       # Persist bot certificate so it keeps the same identity across restarts
       # (required for Mumble ACL/registration)
       - porto-certs:/app/certs
+      # Location history + last-known state (see GPS section in README)
+      - porto-tracks:/app/tracks
+      # TAK client certificate for TLS auth (see GPS section in README)
+      # - ./takcerts:/app/takcerts:ro
     restart: unless-stopped
 
 volumes:
   porto-certs:
+  porto-tracks:

@@ -6,3 +6,13 @@ porto-watchdog
 ptt_bridge
 
 knob_reader
+
+# TAK Server deployment (contains certs, keys and DB password - never commit)
+TAK/
+.claude/settings.local.json
+
+# apktool build intermediates
+pttbridge/build/
+
+# dev handoff notes - not for the public repo
+GPS_TAK_HANDOFF.md

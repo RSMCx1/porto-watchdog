@@ -371,6 +371,15 @@ Test everything:
   TAK enabled, a 911 alert also pops on the ATAK map - press ident
   (F2) to clear it everywhere
 
+**Register the radio (recommended):** once the radio has connected,
+register its user on the Mumble server (right-click the user ->
+**Register**, same as the bot in Step 1c) and gate your channels with
+ACLs so only registered users can enter and speak. Registration binds
+to the client certificate Mumla generated on the radio, so the server
+password is then only the front door - an unregistered client that
+knows it still can't use your channels. This is also what makes a
+lost radio easy to revoke (see [Security](#security)).
+
 **Done. Unplug the USB cable. The radio is onboarded.**
 
 ## GPS Tracking (TAK integration)
@@ -728,16 +737,20 @@ Unsigned or expired packets are silently dropped.
    remove or replace that radio's entry and restart the container -
    all other radios keep working. With a shared `SECRET`, all radios
    must be re-keyed.
-2. **Cut its voice access**: Mumla on the radio has your Mumble server
-   address and password saved, so change
-   `MUMBLE_SERVER_PASSWORD` (server + the remaining radios' Mumla).
+2. **Cut its voice access**: unregister the radio's user on the
+   Mumble server and remove its ACL entries - registration is bound
+   to the Mumla client certificate on that radio, so with channels
+   ACL-gated to registered users (the recommended setup from Step 3),
+   the saved server password alone gets a thief no further than the
+   front door. Rotating `MUMBLE_SERVER_PASSWORD` on top of that is
+   optional belt-and-braces.
 3. **TAK: nothing to revoke.** Radios never hold TAK credentials -
    the only TAK client certificates belong to the bot itself (they
    show up in the TAK web UI as user `porto`/your enrollment user,
    Device UID `porto-watchdog-<user>`). A lost radio cannot touch the
-   TAK server. If other TAK clients (ATAK phones) enroll later, each
-   shows under its own enrollment username - that `User` column is
-   how you tell certificates apart when revoking.
+   TAK server. If other TAK clients (ATAK phones) enroll later, give
+   each device its own enrollment user - then the `User` column in
+   the TAK certificate list is a per-device revocation handle.
 
 ## Files
 

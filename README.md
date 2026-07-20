@@ -722,10 +722,22 @@ All key events forwarded to the remote watchdog are authenticated.
 
 Unsigned or expired packets are silently dropped.
 
-**Revoking a compromised radio:** If using per-radio secrets (`SECRETS`),
-remove or replace that radio's entry and restart the container. All other
-radios keep working. If using a shared secret (`SECRET`), all radios
-must be re-keyed.
+**Lost or compromised radio - the full checklist:**
+
+1. **Cut its command access**: with per-radio secrets (`SECRETS`),
+   remove or replace that radio's entry and restart the container -
+   all other radios keep working. With a shared `SECRET`, all radios
+   must be re-keyed.
+2. **Cut its voice access**: Mumla on the radio has your Mumble server
+   address and password saved, so change
+   `MUMBLE_SERVER_PASSWORD` (server + the remaining radios' Mumla).
+3. **TAK: nothing to revoke.** Radios never hold TAK credentials -
+   the only TAK client certificates belong to the bot itself (they
+   show up in the TAK web UI as user `porto`/your enrollment user,
+   Device UID `porto-watchdog-<user>`). A lost radio cannot touch the
+   TAK server. If other TAK clients (ATAK phones) enroll later, each
+   shows under its own enrollment username - that `User` column is
+   how you tell certificates apart when revoking.
 
 ## Files
 

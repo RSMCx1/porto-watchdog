@@ -234,7 +234,7 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 #define CHANNEL_PKT_SIZE   77   /* cmd + radio_id + ts + name(32) + HMAC */
 #define CHANNEL_NAME_LEN   32
 #define CHANNEL_SIGNED_LEN 45   /* bytes covered by the HMAC */
-#define CHANNEL_FILE   "/data/local/tmp/channel.txt"
+#define SCREENVARS_FILE "/data/local/tmp/screenvars.txt"
 #define HEARTBEAT_MS    60000
 #define CHANNEL_REPLAY_S   30
 
@@ -778,14 +778,15 @@ static int send_udp_command(int sock_fd, struct sockaddr_in *dest,
     return 1;
 }
 
-/* ---- Channel feedback (server -> radio) ----
+/* ---- Screen feedback (server -> radio) ----
  * The server replies to every packet we send (including the minutely
  * 'H' heartbeat) with a signed 'C' packet carrying our current Mumble
- * channel name. After verification it lands in CHANNEL_FILE, which
- * the (patched) Te300k idle screen polls. Empty name = our user is
- * not connected to Mumble; the screen shows "Disconnected".
+ * channel name and, space permitting, our callsign. After verification
+ * these land in SCREENVARS_FILE as key=value lines (channel=, id=),
+ * which the (patched) Te300k idle screen polls. Empty channel = our
+ * user is not connected to Mumble; the screen shows "Disconnected".
  *
- * CHANNEL_FILE must already exist with mode 666 (onboarding does
+ * SCREENVARS_FILE must already exist with mode 666 (onboarding does
  * touch + chmod) - /data/local/tmp itself is not writable by our
  * uid, but an existing world-writable file in it is. */
 static unsigned int last_channel_ts = 0;
@@ -816,18 +817,20 @@ static void handle_channel_packet(void) {
     memcpy(name, buf + 13, CHANNEL_NAME_LEN);
     name[CHANNEL_NAME_LEN] = '\0';
     name[CHANNEL_NAME_LEN + 1] = '\0';
-    fd = open(CHANNEL_FILE, O_WRONLY | O_TRUNC | O_CREAT, 0666);
+    fd = open(SCREENVARS_FILE, O_WRONLY | O_TRUNC | O_CREAT, 0666);
     if (fd < 0) return;
-    /* line 1: channel (may be empty = disconnected); line 2: callsign
-     * (second null-terminated string, if the server sent one) */
+    /* key=value screen variables: channel (empty = disconnected) and
+     * id (the callsign; second null-terminated string, if the server
+     * sent one). Add more keys here as the screen grows. */
     {
         const char *callsign = "";
-        char out[2 * CHANNEL_NAME_LEN + 4];
+        char out[2 * CHANNEL_NAME_LEN + 32];
         int olen;
         len = strlen(name);
         if (len + 1 < CHANNEL_NAME_LEN)
             callsign = name + len + 1;
-        olen = snprintf(out, sizeof(out), "%s\n%s\n", name, callsign);
+        olen = snprintf(out, sizeof(out), "channel=%s\nid=%s\n",
+                        name, callsign);
         if (olen > 0) {
             w = write(fd, out, (size_t)olen);
             (void)w;

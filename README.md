@@ -569,10 +569,11 @@ How it works: the server replies to every packet a radio sends
 (including a minutely `'H'` heartbeat from the local watchdog) with a
 signed `'C'` packet carrying the radio's current channel name. The
 local watchdog verifies it (HMAC + replay window - nobody else can
-write to your screen) and stores it in `/data/local/tmp/channel.txt`
-(two lines: channel name, callsign). The idle screen polls that file
-every few seconds; a stale (>150s) or empty first line means
-`Disconnected`.
+write to your screen) and stores it in
+`/data/local/tmp/screenvars.txt` as `key=value` lines
+(`channel=<name>`, `id=<callsign>`). The idle screen polls that file
+every few seconds; a stale (>150s) or missing file, or an empty
+`channel=`, means `Disconnected`.
 
 The server and watchdog sides ship with this repo and are always on -
 the reply simply goes unused if you skip the screen part. Radio side,
@@ -581,7 +582,7 @@ one-time:
 1. Create the exchange file (the daemon can only write to existing
    files in `/data/local/tmp`, not create them):
    ```bash
-   adb shell "touch /data/local/tmp/channel.txt && chmod 666 /data/local/tmp/channel.txt"
+   adb shell "touch /data/local/tmp/screenvars.txt && chmod 666 /data/local/tmp/screenvars.txt"
    ```
 2. Patch the stock screen app. The firmware's `Te300k.apk` is signed
    with the public AOSP platform test keys - same story as
@@ -596,9 +597,10 @@ one-time:
    - `MainActivity$2.smali`: the clock tick sleep `0xea60` (60s)
      becomes `0xbb8` (3s)
    - `MainActivity$1.smali`: the clock case (`sswitch_0`) calls
-     helpers that read `channel.txt` - line 1 into the center text
-     (fresh + non-empty -> `Channel: <name>`, else `Disconnected`),
-     line 2 into `ID: <callsign>`
+     helpers that read `screenvars.txt` - `channel=` into the center
+     text (fresh + non-empty -> `Channel: <name>`, else
+     `Disconnected`) and `id=` into `ID: <callsign>` (falling back to
+     knob.conf's `radio_id` before first server contact)
 
    The patched APK is the vendor's firmware app, so it is not
    distributed in this repo. Rollback at any time with

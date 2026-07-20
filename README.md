@@ -820,3 +820,19 @@ the [latest release](../../releases/latest) or the
 - **More on the idle screen** - the channel display (above) covered the
   main wish; candidates for the remaining screen real estate: GPS fix
   status, server link quality, battery-friendly dark mode
+- **Encrypt command traffic** - GPS positions are already encrypted in
+  transit; the knob/button commands and the channel-name replies are
+  HMAC-signed but still cleartext, so an on-path observer can see
+  *what* a radio is doing (switch, ident, emergency, heartbeat) and
+  which channel it is on. Extending the existing `'L'` keystream
+  construction to the command byte and the `'C'` name field would
+  close that, hiding command semantics and channel names. radio_id
+  stays cleartext (it selects the per-radio key) and packet
+  timing/size still leak, so this hides *what*, not *that* a radio is
+  active
+- **WireGuard integration** - wrap the whole radio-to-server UDP flow
+  in a tunnel to encrypt everything, metadata included (radio_id,
+  timing), with no protocol changes. Needs validating on the TE300K
+  (Android 6, no root) and weighing against the current design's
+  from-any-network resilience - an always-on tunnel becomes a new
+  single point of failure

@@ -15,7 +15,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Channel knob** - turn the knob on the radio to switch between channels, just like a traditional two-way radio
 - **Voice announcements** - the radio speaks the channel name out loud every time you switch, so you always know where you are without looking at the screen
 - **Emergency alert** - press the emergency button and everyone in your channel hears an alert broadcast through their speaker; with TAK enabled, a 911 alert also pops up on every ATAK/WinTAK map at the radio's last known position
-- **Ident** - press the side button and your name is announced to the channel, useful for roll calls or check-ins
+- **Ident** - press the side button and your name is announced to the channel, useful for roll calls or check-ins - and it cancels the radio's active TAK emergency alert
 - **Connect notification** - when a radio powers on and joins the server, it receives a spoken confirmation that it is connected and which channel it is in
 - **Fully customizable** - every announcement, alert message, and notification can be changed to say whatever you want
 - **Channel management** - choose which channels are available on the knob, skip channels you don't need, control the order they appear in
@@ -25,7 +25,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
-- **Self-healing** - a watchdog on the radio checks every minute that Mumla and the local daemon are alive and relaunches whichever died. No adb cable needed in the field
+- **Self-healing** - a watchdog on the radio checks every minute that Mumla and the local daemon are alive and relaunches whichever died (recovery within ~2 minutes). No adb cable needed in the field
 - **Server runs anywhere** - the server side runs as a Docker container with all settings configured through environment variables, making it easy to deploy on any machine or manage through Portainer
 
 ## How It Works
@@ -75,6 +75,7 @@ Two watchdogs work together:
   │  │      F13 → remote watchdog (UDP)         │  │
   │  │      F14 → remote watchdog (UDP)         │  │
   │  │    Encrypts GPS fixes → 'L' packet (UDP) │  │
+  │  │    'C' replies → screenvars.txt (screen) │  │
   │  └──┬────────────────▲─────────┬────────────┘  │
   │     │ PTT socket     │ GPS     │ UDP :4378     │
   │  ┌──┴────────────────┴────┐    │               │
@@ -141,7 +142,10 @@ Position reports get one extra step: the coordinate block is
 decrypted (each radio's keystream derives from its existing secret),
 turned into a Cursor-on-Target event, and streamed to the TAK server
 over a persistent TLS connection - see
-[GPS Tracking](#gps-tracking-tak-integration).
+[GPS Tracking](#gps-tracking-tak-integration). On the TAK side the
+bot also announces itself as a contact named `porto-watchdog`, which
+is what lets it receive chat commands ("trail P1 yesterday") and
+answer in chat.
 
 The bot auto-generates a TLS client certificate on first start and
 stores it in a Docker volume (`CERT_DIR`, default `/app/certs`). This
@@ -347,13 +351,16 @@ says General"), or silence the bot name entirely by setting it to a
 character that TTS ignores (e.g. `|`). With `|` as the bot name, TTS
 just reads the message itself with no prefix. That's what I use.
 
+If you change `BOT_USERNAME` after Step 1c, redo the registration and
+Move-ACL grant for the new name - they are tied to the username.
+
 ### Step 3: Verify
 
 Reboot the radio. On boot, `pttbridge.apk` automatically:
 1. Starts the PTT socket service
 2. Launches the `porto-watchdog` local watchdog daemon
 3. Opens Mumla and connects to your Mumble server
-4. Returns to the home screen after connecting
+4. Returns to the home screen (about 15 seconds after boot)
 
 Test everything:
 - **Knob** - turn it, you should hear the channel name announced
@@ -361,7 +368,8 @@ Test everything:
 - **RSM PTT** - plug in a speaker-mic, hold its button - same as body PTT
 - **Side button (F2)** - your name gets announced to the channel
 - **Emergency (F3)** - "alert alert" broadcasts to the channel; with
-  TAK enabled, a 911 alert also pops on the ATAK map
+  TAK enabled, a 911 alert also pops on the ATAK map - press ident
+  (F2) to clear it everywhere
 
 **Done. Unplug the USB cable. The radio is onboarded.**
 
@@ -524,7 +532,7 @@ Notes:
   volume (disable with
   `TRACK_HISTORY: "false"`). Export a day - or everything - as GPX:
   ```bash
-  docker exec porto-watchdog python channel_bot.py --export-gpx radio01 2026-07-20 > trip.gpx
+  docker exec porto-watchdog python3 channel_bot.py --export-gpx radio01 2026-07-20 > trip.gpx
   ```
   Roughly 300 KB per radio per day at a 30s interval. Exports and
   trails are jitter-filtered by default; add `--raw` to `--export-gpx`
@@ -550,8 +558,8 @@ Notes:
   server's location instead of 0,0. The same is available from the
   server CLI:
   ```bash
-  docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-20
-  docker exec porto-watchdog python channel_bot.py --publish-trail radio01 2026-07-18 2026-07-22 --trail-ttl 120
+  docker exec porto-watchdog python3 channel_bot.py --publish-trail radio01 2026-07-20
+  docker exec porto-watchdog python3 channel_bot.py --publish-trail radio01 2026-07-18 2026-07-22 --trail-ttl 120
   ```
 - First GPS fix after power-on can take a couple of minutes cold.
 
@@ -599,13 +607,19 @@ one-time:
    - `MainActivity$1.smali`: the clock case (`sswitch_0`) calls
      helpers that read `screenvars.txt` - `channel=` into the center
      text (fresh + non-empty -> `Channel: <name>`, else
-     `Disconnected`) and `id=` into `ID: <callsign>` (falling back to
-     knob.conf's `radio_id` before first server contact)
+     `Disconnected`) and `id=` into `ID: <callsign>` (`ID: --` until
+     the server has said who we are - deliberately never the internal
+     radio_id, which is a different identifier)
 
    The patched APK is the vendor's firmware app, so it is not
    distributed in this repo. Rollback at any time with
    `adb uninstall com.android.te300k` - that removes the update and
    restores the factory screen from `/system`.
+
+A radio onboarded before this feature existed also needs the current
+`porto-watchdog` binary (Steps 2d-2e) - older binaries neither send
+the heartbeat nor write `screenvars.txt`, so the screen would sit on
+`Disconnected` forever.
 
 Without the patch nothing changes on the radio - the feature is
 inert.
@@ -624,6 +638,9 @@ If you use per-radio secrets, add the new radio to `SECRETS` too.
 For GPS tracking, additionally run the three "Radio side" commands
 from [GPS Tracking](#gps-tracking-tak-integration) on the new radio,
 and give it a friendly map name in `TAK_CALLSIGNS` if you use those.
+For the channel display, repeat the
+[screen steps](#channel-display-on-the-radio-screen-optional)
+(`screenvars.txt` + the patched screen app).
 
 ## RADIOS Format
 
@@ -743,7 +760,9 @@ the [latest release](../../releases/latest) or the
 - **No GPS markers in ATAK** - check the chain step by step: `adb shell logcat -d | grep porto-watchdog` should show `LOC <lat> <lon>` lines when fixes flow. No lines? Check `loc.conf` exists, the location permission is granted (`adb shell dumpsys package com.pttbridge | grep ACCESS_FINE`), and GPS is enabled (`adb shell settings get secure location_providers_allowed`). Lines but no markers? Check the remote watchdog logs (`docker logs porto-watchdog`) for `TAK: connected` / `TAK: first position`, and that the TAK input you chose (stock TLS 8089, or STCP 8087) is reachable from the container
 - **`TAK: enrollment failed` in the logs** - the enrollment user must exist on the TAK server and `TAK_ENROLL_PASS` must match. Remember TAK's password complexity rule (15+ chars, upper/lower/digit/special) when creating the user. Also check the container can reach the enrollment port: `TAK_ENROLL_PORT` (default 8446) is separate from the streaming input port
 - **RSM PTT not working** - the daemon logs `rsm_ptt=/dev/input/event2` at startup (`adb shell logcat -d | grep porto-watchdog`). If it says `RSM PTT not available`, check the `ptt_device` line in `knob.conf`
-- **Emergency doesn't appear on the TAK map** - the 911 alert is placed at the radio's last known position, which the bot keeps in memory: the radio must have reported at least one position since the bot last (re)started. Check the logs for `TAK: no position known for <radio>`. The Mumble voice alert is unaffected either way
+- **Emergency doesn't appear on the TAK map** - the 911 alert is placed at the radio's last known position, so the radio must have reported at least one position (positions and alert state persist across bot restarts). Check the logs for `TAK: no position known for <radio>`. The Mumble voice alert is unaffected either way
+- **Screen shows `Disconnected` or `ID: --`** - check the exchange file exists with the right mode: `adb shell ls -l /data/local/tmp/screenvars.txt` (must be `-rw-rw-rw-`), then watch it fill: `adb shell cat /data/local/tmp/screenvars.txt` (updates within a minute). Empty forever? The radio is probably running an older `porto-watchdog` binary that neither heartbeats nor writes the file - re-push it (Steps 2d-2e). File filling but screen stuck? The patched screen app isn't installed. `ID: --` alone just means the server hasn't confirmed the callsign yet
+- **Stray `porto-watchdog` marker at 0,0 on the map** - that's the bot's own presence beacon (TAK only delivers chat commands to announced contacts). Set `TAK_BOT_POSITION: "lat,lon"` to pin it at your server's location, or ignore it
 - **Radio has no GPS fix indoors** - normal; cold start can take minutes and needs sky view. Test near a window or outside
 
 ## Roadmap

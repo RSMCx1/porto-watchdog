@@ -10,7 +10,7 @@ services:
       - "4378:4378/udp"
     environment:
       # -- Mumble server --
-      MUMBLE_HOST: zip-mumble-server
+      MUMBLE_HOST: mumble-server
       MUMBLE_PORT: "64738"
       BOT_USERNAME: ChannelBot
       MUMBLE_SERVER_PASSWORD: ""

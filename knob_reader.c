@@ -22,10 +22,10 @@
  *     field holds the channel name and, space permitting, the radio's
  *     callsign as a second null-terminated string. Verified (id +
  *     HMAC + 30s replay window) and written to
- *     /data/local/tmp/channel.txt as two lines (channel, callsign),
- *     which the patched Te300k idle screen displays ("Channel: X" /
- *     "Disconnected" + "ID: <callsign>"). Empty channel = our user
- *     is not connected to Mumble.
+ *     /data/local/tmp/screenvars.txt as key=value lines (channel=,
+ *     id=), which the patched Te300k idle screen displays
+ *     ("Channel: X" / "Disconnected" + "ID: <callsign>"). Empty
+ *     channel = our user is not connected to Mumble.
  *     /dev/input/event4  KEY_F13 (183) = Previous channel
  *     /dev/input/event4  KEY_F14 (184) = Next channel
  *     GPS fixes from pttbridge.apk (abstract socket "porto_loc")

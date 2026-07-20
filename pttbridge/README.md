@@ -10,6 +10,7 @@ a handful of classes:
 | `BridgeService` | Launches the `porto-watchdog` daemon, launches Mumla, injects the auto-connect keypress, starts the threads below |
 | `BridgeService$SocketThread` | Serves abstract local socket `ptt_bridge`; byte `'1'`/`'0'` -> Mumla TALK on/off broadcast |
 | `BridgeService$HomeRunner` | 15s after boot, returns to the home screen |
+| `HealthRunner` | Self-heal watchdog: scans `/proc` every minute and relaunches Mumla (incl. auto-connect) or the daemon if either died |
 | `LocRunner` | Reads `/data/local/tmp/loc.conf` (GPS interval in seconds, opt-in); registers a GPS listener |
 | `LocListener` | Each GPS fix -> `"lat lon alt speed bearing accuracy\n"` -> `LocSender` |
 | `LocSender` | Writes the fix line to the daemon's abstract local socket `porto_loc` |

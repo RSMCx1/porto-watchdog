@@ -582,6 +582,9 @@ the radio's user isn't on Mumble - plus the radio's identity
 and the soft-key label bracketed as `[Settings]` so button
 indications are visually distinct from status text.
 
+<img src="radio-screen.jpg" alt="TE300K idle screen showing Channel: TAC 3 and ID: P2 with a bracketed [Settings] soft-key label" width="260">
+
+
 How it works: the server replies to every packet a radio sends
 (including a minutely `'H'` heartbeat from the local watchdog) with a
 signed `'C'` packet carrying the radio's current channel name. The

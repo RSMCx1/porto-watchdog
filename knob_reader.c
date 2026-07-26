@@ -264,6 +264,19 @@ static char cfg_device[256] = "/dev/input/event4";           /* knob */
 static char cfg_button_device[256] = "/dev/input/event3";    /* body buttons (gpio-keys) */
 static char cfg_ptt_device[256] = "/dev/input/event2";       /* RSM PTT (telo_ptt) */
 
+/* Custom APN (optional). Fixes outdated / roaming-incompatible carrier APNs on
+ * locked-down radios by writing the operator's correct APN through the
+ * platform-signed apn-setter app. Inert unless apn_enabled=true and apn is set. */
+static int  cfg_apn_enabled = 0;
+static char cfg_apn[64] = "";
+static char cfg_apn_name[64] = "";
+static char cfg_apn_mcc[8] = "";
+static char cfg_apn_mnc[8] = "";
+static char cfg_apn_protocol[16] = "IPV4V6";
+static char cfg_apn_roaming_protocol[16] = "IP";
+static char cfg_apn_type[64] = "default,supl";
+static char cfg_apn_disable[64] = "";
+
 static int want_udp = 0;     /* config says we should use UDP */
 static int udp_enabled = 0;  /* DNS resolved, UDP is working */
 
@@ -855,10 +868,59 @@ static int load_config(const char *path) {
             else if (strcmp(key, "device") == 0) strncpy(cfg_device, val, sizeof(cfg_device)-1);
             else if (strcmp(key, "button_device") == 0) strncpy(cfg_button_device, val, sizeof(cfg_button_device)-1);
             else if (strcmp(key, "ptt_device") == 0) strncpy(cfg_ptt_device, val, sizeof(cfg_ptt_device)-1);
+            else if (strcmp(key, "apn_enabled") == 0) cfg_apn_enabled = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "yes") == 0);
+            else if (strcmp(key, "apn") == 0) strncpy(cfg_apn, val, sizeof(cfg_apn)-1);
+            else if (strcmp(key, "apn_name") == 0) strncpy(cfg_apn_name, val, sizeof(cfg_apn_name)-1);
+            else if (strcmp(key, "apn_mcc") == 0) strncpy(cfg_apn_mcc, val, sizeof(cfg_apn_mcc)-1);
+            else if (strcmp(key, "apn_mnc") == 0) strncpy(cfg_apn_mnc, val, sizeof(cfg_apn_mnc)-1);
+            else if (strcmp(key, "apn_protocol") == 0) strncpy(cfg_apn_protocol, val, sizeof(cfg_apn_protocol)-1);
+            else if (strcmp(key, "apn_roaming_protocol") == 0) strncpy(cfg_apn_roaming_protocol, val, sizeof(cfg_apn_roaming_protocol)-1);
+            else if (strcmp(key, "apn_type") == 0) strncpy(cfg_apn_type, val, sizeof(cfg_apn_type)-1);
+            else if (strcmp(key, "apn_disable") == 0) strncpy(cfg_apn_disable, val, sizeof(cfg_apn_disable)-1);
         }
     }
     fclose(f);
     return 1;
+}
+
+/* Apply a custom APN by launching the platform-signed apn-setter app with the
+ * settings from knob.conf. Called once at daemon startup - which, via the
+ * pttbridge boot autostart, happens on every boot and so re-applies the APN
+ * after the firmware re-seeds its own default on each boot. No-op unless
+ * apn_enabled=true and apn is set. Best-effort; failure never blocks the radio. */
+static void apply_apn(void) {
+    char numeric[16];
+    char buf[256];
+    char *argv[40];
+    int i = 0, tries;
+
+    if (!cfg_apn_enabled || !cfg_apn[0]) return;
+
+    snprintf(numeric, sizeof(numeric), "%s%s", cfg_apn_mcc, cfg_apn_mnc);
+
+    argv[i++] = (char *)"/system/bin/am";
+    argv[i++] = (char *)"start";
+    argv[i++] = (char *)"-n";
+    argv[i++] = (char *)"com.porto.apnsetter/.ApnSetterActivity";
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"apn";              argv[i++] = cfg_apn;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"mcc";              argv[i++] = cfg_apn_mcc;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"mnc";              argv[i++] = cfg_apn_mnc;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"numeric";          argv[i++] = numeric;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"protocol";         argv[i++] = cfg_apn_protocol;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"roaming_protocol"; argv[i++] = cfg_apn_roaming_protocol;
+    argv[i++] = (char *)"--es"; argv[i++] = (char *)"type";             argv[i++] = cfg_apn_type;
+    if (cfg_apn_name[0])    { argv[i++] = (char *)"--es"; argv[i++] = (char *)"name";    argv[i++] = cfg_apn_name; }
+    if (cfg_apn_disable[0]) { argv[i++] = (char *)"--es"; argv[i++] = (char *)"disable"; argv[i++] = cfg_apn_disable; }
+    argv[i] = NULL;
+
+    /* am occasionally isn't ready the instant we start; retry a few times. */
+    for (tries = 0; tries < 4; tries++) {
+        int n = exec_read("/system/bin/am", argv, buf, sizeof(buf));
+        if (n > 0 && strstr(buf, "Starting")) break;   /* intent dispatched */
+        sleep(3);
+    }
+    fprintf(stderr, "porto-watchdog: applied custom APN '%s' (mcc=%s mnc=%s)\n",
+            cfg_apn, cfg_apn_mcc, cfg_apn_mnc);
 }
 
 int main(int argc, char *argv[]) {
@@ -900,6 +962,10 @@ int main(int argc, char *argv[]) {
     if (config_loaded && cfg_host[0] && cfg_radio_id[0] && cfg_secret[0]) {
         want_udp = 1;
     }
+
+    /* Apply a custom APN if configured (fixes outdated/roaming APNs). Runs on
+     * every boot so it survives the firmware re-seeding its default APN. */
+    apply_apn();
 
     /*
      * Boot-resilient startup sequence:

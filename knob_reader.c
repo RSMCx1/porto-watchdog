@@ -926,7 +926,7 @@ static void apply_apn(void) {
     char numeric[16];
     char buf[256];
     char *argv[40];
-    int i, tries;
+    int i;
 
     if (!cfg_custom_apn_mode || !cfg_apn[0]) return;
 
@@ -943,6 +943,8 @@ static void apply_apn(void) {
     i = 0;
     argv[i++] = (char *)"/system/bin/am";
     argv[i++] = (char *)"start";
+    argv[i++] = (char *)"-f";
+    argv[i++] = (char *)"0x20";   /* FLAG_INCLUDE_STOPPED_PACKAGES */
     argv[i++] = (char *)"-n";
     argv[i++] = (char *)"com.porto.apnsetter/.ApnSetterActivity";
     argv[i++] = (char *)"--es"; argv[i++] = (char *)"apn";              argv[i++] = cfg_apn;
@@ -955,14 +957,31 @@ static void apply_apn(void) {
     if (cfg_apn_name[0]) { argv[i++] = (char *)"--es"; argv[i++] = (char *)"name"; argv[i++] = cfg_apn_name; }
     argv[i] = NULL;
 
-    /* am occasionally isn't ready the instant we start; retry a few times. */
-    for (tries = 0; tries < 4; tries++) {
-        int n = exec_read("/system/bin/am", argv, buf, sizeof(buf));
-        if (n > 0 && strstr(buf, "Starting")) break;   /* intent dispatched */
-        sleep(3);
+    /* Fire the setter, then VERIFY the live data connection actually moved onto
+     * our APN, and retry if not. This self-heals against early-boot timing (am
+     * or AMS not ready yet, or the app freshly installed in the "stopped" state)
+     * and against a firmware APN re-seed landing after us. Bounded to ~60s so it
+     * can never hang - and it runs in the detached grandchild, never on the
+     * daemon's own path. */
+    {
+        char *sh[4];
+        int attempt, n;
+
+        sh[0] = (char *)"/system/bin/sh";
+        sh[1] = (char *)"-c";
+        sh[2] = (char *)"dumpsys connectivity | grep -o 'extra: [^ ,]*'";
+        sh[3] = NULL;
+
+        for (attempt = 0; attempt < 6; attempt++) {
+            exec_read("/system/bin/am", argv, buf, sizeof(buf));
+            sleep(8);   /* let the app write the DB and the data call re-establish */
+            n = exec_read("/system/bin/sh", sh, buf, sizeof(buf));
+            if (n > 0 && strstr(buf, cfg_apn)) break;   /* live data is on our APN */
+            sleep(2);
+        }
+        fprintf(stderr, "porto-watchdog: custom APN '%s' apply done (live=%s)\n",
+                cfg_apn, buf);
     }
-    fprintf(stderr, "porto-watchdog: applied custom APN '%s' (mcc=%s mnc=%s)\n",
-            cfg_apn, cfg_apn_mcc, cfg_apn_mnc);
     _exit(0);
 }
 

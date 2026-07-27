@@ -661,8 +661,10 @@ applied. It's generic (works for any carrier) and entirely opt-in.
 - The **watchdog daemon** reads the config from `knob.conf` and, when
   `custom_apn_mode=true`, launches the helper on every boot - after waiting for
   the SIM to register (so the firmware's own profile is loaded first), in a
-  background fork so PTT/knob handling is never delayed. Many firmwares re-seed
-  their default APN on reboot, so re-applying each boot is what makes the fix stick.
+  background fork so PTT/knob handling is never delayed. It then confirms the
+  live data connection actually moved onto the new APN and retries a few times
+  if an early-boot race got in the way. Many firmwares re-seed their default APN
+  on reboot, so re-applying each boot is what makes the fix stick.
 
 ### Setup
 

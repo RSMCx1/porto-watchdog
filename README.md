@@ -657,7 +657,9 @@ applied. It's generic (works for any carrier) and entirely opt-in.
   `WRITE_APN_SETTINGS` - a signature-level permission `adb` and normal apps can't
   get - and writes the APN into Android's telephony provider: it inserts the APN,
   makes it the preferred APN, and **disables every other APN** so the firmware
-  can't re-select a stale one (you never have to name it).
+  can't re-select a stale one (you never have to name it). It runs **headless**
+  (creates no window), so it never grabs focus from the radio screen or interrupts
+  Mumla's auto-connect at boot.
 - The **watchdog daemon** reads the config from `knob.conf` and, when
   `custom_apn_mode=true`, launches the helper on every boot - after waiting for
   the SIM to register (so the firmware's own profile is loaded first), in a
@@ -901,6 +903,7 @@ the [latest release](../../releases/latest) or the
 - **Stray `porto-watchdog` marker at 0,0 on the map** - that's the bot's own presence beacon (TAK only delivers chat commands to announced contacts). Set `TAK_BOT_POSITION: "lat,lon"` to pin it at your server's location, or ignore it
 - **Radio has no GPS fix indoors** - normal; cold start can take minutes and needs sky view. Test near a window or outside
 - **Mobile data works at home but dies abroad / across a border** - the radio is probably stuck on a stale carrier APN with no roaming route. Check the APN in use: `adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"`. If it's an old per-network entry, set your operator's current APN via [Custom APN](#custom-apn-roaming-fix-optional). Note that the roaming toggle and network mode are rarely the cause when voice/registration work abroad - it's usually the APN
+- **With Custom APN on, Mumla takes a bit to connect after a cold boot** - normal. Applying the APN briefly cycles the data connection while the radio is still bringing up its cellular link, so Mumla's first connect attempt can come before data is ready. Mumla's own auto-reconnect brings it back once data is up (usually within a minute) - no action needed
 
 ## Roadmap
 

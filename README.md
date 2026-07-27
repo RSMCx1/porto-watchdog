@@ -656,11 +656,13 @@ applied. It's generic (works for any carrier) and entirely opt-in.
 - A tiny **platform-signed** helper app (`apn-setter.apk`) holds
   `WRITE_APN_SETTINGS` - a signature-level permission `adb` and normal apps can't
   get - and writes the APN into Android's telephony provider: it inserts the APN,
-  makes it the preferred APN, and optionally disables a stale built-in APN so the
-  firmware can't re-select it.
-- The **watchdog daemon** reads the APN from `knob.conf` and launches the helper
-  on every boot. Many firmwares re-seed their default APN on reboot, so
-  re-applying each boot is what makes the fix stick.
+  makes it the preferred APN, and **disables every other APN** so the firmware
+  can't re-select a stale one (you never have to name it).
+- The **watchdog daemon** reads the config from `knob.conf` and, when
+  `custom_apn_mode=true`, launches the helper on every boot - after waiting for
+  the SIM to register (so the firmware's own profile is loaded first), in a
+  background fork so PTT/knob handling is never delayed. Many firmwares re-seed
+  their default APN on reboot, so re-applying each boot is what makes the fix stick.
 
 ### Setup
 
@@ -681,7 +683,7 @@ adb shell getprop gsm.sim.operator.numeric   # first 3 digits = MCC, rest = MNC
 ```
 
 Then look up your carrier's current data APN (their website or a public APN
-list). To see which APN is active right now - and spot a stale one to disable:
+list). To see which APN is active right now:
 
 ```bash
 adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # the APN in use now
@@ -690,7 +692,7 @@ adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # the APN in use now
 **3. Enable it in `knob.conf`** and re-push the file (Step 2e):
 
 ```ini
-apn_enabled=true
+custom_apn_mode=true         # master switch (default false)
 apn=internet                 # your operator's current data APN
 apn_mcc=001                  # your operator's MCC (from getprop above)
 apn_mnc=01                   # your operator's MNC
@@ -698,7 +700,6 @@ apn_name=My Carrier          # optional label
 apn_protocol=IPV4V6          # IP | IPV6 | IPV4V6
 apn_roaming_protocol=IP
 apn_type=default,supl
-apn_disable=oldapn           # optional: stale built-in APN to turn off
 ```
 
 The daemon applies this on its next start. To apply now without a reboot, restart
@@ -711,8 +712,8 @@ adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # -> extra: <your ap
 ```
 
 The real test is at the border: with the correct APN forced, data comes up while
-roaming where it used to die. To roll back, set `apn_enabled=false` (or re-point
-`apn` at the old value) and restart the service.
+roaming where it used to die. To roll back, set `custom_apn_mode=false` and
+restart the service (the radio returns to the firmware's own APN on next boot).
 
 ## Adding More Radios
 

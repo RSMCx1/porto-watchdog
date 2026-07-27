@@ -9,7 +9,7 @@ README); the app itself hardcodes nothing.
 
 | Class | Role |
 |-------|------|
-| `ApnSetterActivity` | Reads the APN from intent extras (`apn`, `name`, `mcc`, `mnc`, `numeric`, `protocol`, `roaming_protocol`, `type`, optional `disable`), inserts it into `content://telephony/carriers`, makes it the preferred APN, and optionally disables a stale built-in APN so the firmware can't re-select it. Idempotent (dedups by apn+numeric), then finishes - no UI. |
+| `ApnSetterActivity` | Reads the APN from intent extras (`apn`, `name`, `mcc`, `mnc`, `numeric`, `protocol`, `roaming_protocol`, `type`), inserts it into `content://telephony/carriers`, makes it the preferred APN, then **disables every other APN** (`carrier_enabled=0 WHERE _id != <ours>`) so the firmware can't re-select a stale one - you never have to name it. Idempotent (dedups by apn+numeric), then finishes - no UI. |
 | `VerifyActivity` | Debug only: logs the current preferred APN (name / apn / protocol / roaming_protocol) to logcat tag `ApnVerify`. |
 
 ## Why platform-signed
@@ -65,8 +65,7 @@ jarsigner -J-Djava.security.properties=nomd5.props \
 adb install -r apn-setter.apk
 adb shell am start -n com.porto.apnsetter/.ApnSetterActivity \
     --es apn internet --es mcc 204 --es mnc 08 --es numeric 20408 \
-    --es protocol IPV4V6 --es roaming_protocol IP --es type default,supl \
-    --es disable OLD4G.apn
+    --es protocol IPV4V6 --es roaming_protocol IP --es type default,supl
 # apply on the next data reconnect, then confirm:
 adb shell "svc data disable; svc data enable"
 adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # -> extra: internet

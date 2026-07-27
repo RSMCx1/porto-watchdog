@@ -5,8 +5,10 @@
 #   am start -n com.porto.apnsetter/.ApnSetterActivity \
 #     --es apn internet --es name "My APN" --es mcc 204 --es mnc 08 \
 #     --es numeric 20408 --es protocol IPV4V6 --es roaming_protocol IP \
-#     --es type default,supl --es disable OLD.apn.to.turn.off
-# Needs WRITE_APN_SETTINGS, granted because the APK is platform-signed.
+#     --es type default,supl
+# Inserts the APN, makes it preferred, then DISABLES EVERY OTHER APN so the
+# firmware can't re-select a stale one (no need to name it). Needs
+# WRITE_APN_SETTINGS, granted because the APK is platform-signed.
 
 
 # direct methods
@@ -21,11 +23,12 @@
 
 # virtual methods
 .method protected onCreate(Landroid/os/Bundle;)V
-    .locals 8
+    .locals 9
 
     invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
 
-    # v0 = ContentResolver, v1 = Intent, v5 = carriers uri (stable)
+    # v0 = ContentResolver, v1 = Intent, v5 = carriers uri (stable),
+    # v2 = new-APN ContentValues, v8 = inserted _id (held to the end)
     invoke-virtual {p0}, Landroid/app/Activity;->getContentResolver()Landroid/content/ContentResolver;
 
     move-result-object v0
@@ -40,7 +43,6 @@
 
     move-result-object v5
 
-    # v2 = ContentValues (the new APN); copy each extra into the matching column
     new-instance v2, Landroid/content/ContentValues;
 
     invoke-direct {v2}, Landroid/content/ContentValues;-><init>()V
@@ -115,7 +117,7 @@
 
     invoke-virtual {v2, v3, v4}, Landroid/content/ContentValues;->put(Ljava/lang/String;Ljava/lang/String;)V
 
-    # dedup: delete existing rows with the same apn + numeric (idempotent across boots)
+    # 1) dedup: delete existing rows with the same apn + numeric (idempotent across boots)
     const-string v3, "apn=? AND numeric=?"
 
     const/4 v4, 0x2
@@ -144,25 +146,26 @@
 
     invoke-virtual {v0, v5, v3, v4}, Landroid/content/ContentResolver;->delete(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I
 
-    # insert the new APN
+    # 2) insert the new APN (carrier_enabled=1) BEFORE disabling others,
+    #    so there is never a window with zero enabled APNs
     invoke-virtual {v0, v5, v2}, Landroid/content/ContentResolver;->insert(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;
 
     move-result-object v3
 
     if-eqz v3, :done
 
-    # set preferred APN = inserted id
     invoke-virtual {v3}, Landroid/net/Uri;->getLastPathSegment()Ljava/lang/String;
 
-    move-result-object v4
+    move-result-object v8
 
+    # 3) set preferred APN = inserted id
     new-instance v6, Landroid/content/ContentValues;
 
     invoke-direct {v6}, Landroid/content/ContentValues;-><init>()V
 
     const-string v3, "apn_id"
 
-    invoke-virtual {v6, v3, v4}, Landroid/content/ContentValues;->put(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-virtual {v6, v3, v8}, Landroid/content/ContentValues;->put(Ljava/lang/String;Ljava/lang/String;)V
 
     const-string v3, "content://telephony/carriers/preferapn"
 
@@ -174,36 +177,28 @@
 
     invoke-virtual {v0, v3, v6, v7, v7}, Landroid/content/ContentResolver;->update(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I
 
-    # optional: disable a legacy carrier APN (--es disable <apn>)
-    const-string v3, "disable"
-
-    invoke-virtual {v1, v3}, Landroid/content/Intent;->getStringExtra(Ljava/lang/String;)Ljava/lang/String;
-
-    move-result-object v3
-
-    if-eqz v3, :done
-
+    # 4) disable EVERY OTHER APN: carrier_enabled=0 WHERE _id != <inserted id>
     new-instance v6, Landroid/content/ContentValues;
 
     invoke-direct {v6}, Landroid/content/ContentValues;-><init>()V
 
-    const-string v4, "carrier_enabled"
+    const-string v3, "carrier_enabled"
 
-    const-string v7, "0"
+    const-string v4, "0"
 
-    invoke-virtual {v6, v4, v7}, Landroid/content/ContentValues;->put(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-virtual {v6, v3, v4}, Landroid/content/ContentValues;->put(Ljava/lang/String;Ljava/lang/String;)V
 
-    const-string v4, "apn=?"
+    const-string v3, "_id != ?"
 
-    const/4 v7, 0x1
+    const/4 v4, 0x1
 
-    new-array v7, v7, [Ljava/lang/String;
+    new-array v4, v4, [Ljava/lang/String;
 
-    const/4 v2, 0x0
+    const/4 v7, 0x0
 
-    aput-object v3, v7, v2
+    aput-object v8, v4, v7
 
-    invoke-virtual {v0, v5, v6, v4, v7}, Landroid/content/ContentResolver;->update(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I
+    invoke-virtual {v0, v5, v6, v3, v4}, Landroid/content/ContentResolver;->update(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I
 
     :done
     invoke-virtual {p0}, Landroid/app/Activity;->finish()V

@@ -3,8 +3,8 @@
 
 # Generic custom-APN setter. All values come from intent extras, e.g.:
 #   am start -n com.porto.apnsetter/.ApnSetterActivity \
-#     --es apn internet --es name "My APN" --es mcc 204 --es mnc 08 \
-#     --es numeric 20408 --es protocol IPV4V6 --es roaming_protocol IP \
+#     --es apn internet --es name "My APN" --es mcc 001 --es mnc 01 \
+#     --es numeric 00101 --es protocol IPV4V6 --es roaming_protocol IP \
 #     --es type default,supl
 # Inserts the APN, makes it preferred, then DISABLES EVERY OTHER APN so the
 # firmware can't re-select a stale one (no need to name it). Needs

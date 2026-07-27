@@ -64,7 +64,7 @@ jarsigner -J-Djava.security.properties=nomd5.props \
 ```bash
 adb install -r apn-setter.apk
 adb shell am start -n com.porto.apnsetter/.ApnSetterActivity \
-    --es apn internet --es mcc 204 --es mnc 08 --es numeric 20408 \
+    --es apn internet --es mcc 001 --es mnc 01 --es numeric 00101 \
     --es protocol IPV4V6 --es roaming_protocol IP --es type default,supl
 # apply on the next data reconnect, then confirm:
 adb shell "svc data disable; svc data enable"

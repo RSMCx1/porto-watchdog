@@ -13,13 +13,17 @@
     <application
         android:label="APN Setter"
         android:allowBackup="false">
-        <!-- headless: launched by the watchdog daemon with the APN as extras -->
+        <!-- headless: launched by the watchdog daemon with the APN as extras.
+             NoDisplay = never creates a window or takes focus, so it can't steal
+             the boot auto-connect keypress meant for Mumla. -->
         <activity
             android:name=".ApnSetterActivity"
-            android:exported="true"/>
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"/>
         <!-- read-only: logs the current preferred APN to logcat tag ApnVerify -->
         <activity
             android:name=".VerifyActivity"
-            android:exported="true"/>
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"/>
     </application>
 </manifest>

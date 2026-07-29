@@ -22,6 +22,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **GPS tracking** - radios report their position to a [TAK](https://tak.gov) server, so the whole fleet shows up live on the map in ATAK/WinTAK. Opt-in per radio, off by default, coordinates encrypted in transit - and the bot can enroll its own TAK certificate, so there are no certificate files to manage
 - **Persistent map presence & track history** - radios that power off or lose coverage stay on the TAK map as "last known" markers (surviving server restarts too), and every position is logged server-side with one-command GPX export and on-map trails: a rolling recent-hours line per radio, plus any past date or range on demand - just ask in TAK chat ("trail P1 yesterday")
 - **Channel display on the radio** - the radio's idle screen can show the live Mumble channel name (or "Disconnected"), fed by the server over the same signed UDP link
+- **Custom APN (roaming fix)** - some locked-down radios ship a stale carrier APN that works at home but drops data across a border; a platform-signed helper writes your operator's correct APN from `knob.conf` and re-applies it on every boot. Generic (any carrier), opt-in, off by default
 - **Secured communications** - every command between the radio and server is cryptographically signed and verified
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
@@ -636,6 +637,87 @@ the heartbeat nor write `screenvars.txt`, so the screen would sit on
 Without the patch nothing changes on the radio - the feature is
 inert.
 
+## Custom APN (roaming fix, optional)
+
+Some radios - especially older, locked-down ones - ship with an **outdated
+carrier APN** that works fine at home but silently fails the moment you cross a
+border: the phone registers on the foreign network, but data never comes up.
+Carriers sometimes retire an old per-network APN in favour of a single modern
+one (and the old one has no roaming route), yet the device keeps auto-selecting
+the stale entry. On the TE300K the built-in APN editor is also OEM-locked
+("Access Point Name settings are not available for this user"), so you can't
+just fix it in Settings.
+
+This feature writes your operator's correct APN onto the radio and keeps it
+applied. It's generic (works for any carrier) and entirely opt-in.
+
+### How it works
+
+- A tiny **platform-signed** helper app (`apn-setter.apk`) holds
+  `WRITE_APN_SETTINGS` - a signature-level permission `adb` and normal apps can't
+  get - and writes the APN into Android's telephony provider: it inserts the APN,
+  makes it the preferred APN, and **disables every other APN** so the firmware
+  can't re-select a stale one (you never have to name it). It runs **headless**
+  (creates no window), so it never grabs focus from the radio screen or interrupts
+  Mumla's auto-connect at boot.
+- The **watchdog daemon** reads the config from `knob.conf` and, when
+  `custom_apn_mode=true`, launches the helper on every boot - after waiting for
+  the SIM to register (so the firmware's own profile is loaded first), in a
+  background fork so PTT/knob handling is never delayed, retrying the launch a
+  few times in case am isn't ready yet that early in boot. Many firmwares re-seed
+  their default APN on reboot, so re-applying each boot is what makes the fix stick.
+
+### Setup
+
+**1. Install the helper** (once per radio; app installs must be unlocked first -
+see [Unlocking app installs](#unlocking-app-installs-persistteloinstall)):
+
+```bash
+adb install apn-setter.apk
+```
+
+`apn-setter.apk` is platform-signed exactly like `pttbridge.apk` (build/sign docs
+in `apn-setter/README.md`).
+
+**2. Find your operator's details.** The MCC/MNC the SIM is on:
+
+```bash
+adb shell getprop gsm.sim.operator.numeric   # first 3 digits = MCC, rest = MNC
+```
+
+Then look up your carrier's current data APN (their website or a public APN
+list). To see which APN is active right now:
+
+```bash
+adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # the APN in use now
+```
+
+**3. Enable it in `knob.conf`** and re-push the file (Step 2e):
+
+```ini
+custom_apn_mode=true         # master switch (default false)
+apn=internet                 # your operator's current data APN
+apn_mcc=001                  # your operator's MCC (from getprop above)
+apn_mnc=01                   # your operator's MNC
+apn_name=My Carrier          # optional label
+apn_protocol=IPV4V6          # IP | IPV6 | IPV4V6
+apn_roaming_protocol=IP
+apn_type=default,supl
+```
+
+The daemon applies this on its next start. To apply now without a reboot, restart
+the service (`adb shell am startservice -a com.pttbridge.START`) or reboot.
+
+**4. Verify:**
+
+```bash
+adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"   # -> extra: <your apn>
+```
+
+The real test is at the border: with the correct APN forced, data comes up while
+roaming where it used to die. To roll back, set `custom_apn_mode=false` and
+restart the service (the radio returns to the firmware's own APN on next boot).
+
 ## Adding More Radios
 
 Repeat Step 2 with a different `radio_id` in `knob.conf`.
@@ -652,7 +734,9 @@ from [GPS Tracking](#gps-tracking-tak-integration) on the new radio,
 and give it a friendly map name in `TAK_CALLSIGNS` if you use those.
 For the channel display, repeat the
 [screen steps](#channel-display-on-the-radio-screen-optional)
-(`screenvars.txt` + the patched screen app).
+(`screenvars.txt` + the patched screen app). For the
+[custom APN](#custom-apn-roaming-fix-optional), install `apn-setter.apk` and set
+the `apn_*` keys in the new radio's `knob.conf`.
 
 ## RADIOS Format
 
@@ -790,6 +874,8 @@ Unsigned or expired packets are silently dropped.
 | `docker/Dockerfile` | Docker | Container build |
 | `pttbridge/` | Source | Smali source for pttbridge.apk (build docs inside) |
 | `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect + GPS reader + self-healing watchdog |
+| `apn-setter/` | Source | Smali source for apn-setter.apk (build docs inside) |
+| `apn-setter.apk` | Radio | Platform-signed helper that sets a custom APN (optional roaming fix) |
 | `mumla.apk` | Radio | Mumla v3.6.15 - open-source Mumble client ([GPL-3.0](https://github.com/quite/mumla)) |
 
 Binaries are built automatically by CI - download `porto-watchdog` from
@@ -816,6 +902,8 @@ the [latest release](../../releases/latest) or the
 - **Screen shows `Disconnected` or `ID: --`** - check the exchange file exists with the right mode: `adb shell ls -l /data/local/tmp/screenvars.txt` (must be `-rw-rw-rw-`), then watch it fill: `adb shell cat /data/local/tmp/screenvars.txt` (updates within a minute). Empty forever? The radio is probably running an older `porto-watchdog` binary that neither heartbeats nor writes the file - re-push it (Steps 2d-2e). File filling but screen stuck? The patched screen app isn't installed. `ID: --` alone just means the server hasn't confirmed the callsign yet
 - **Stray `porto-watchdog` marker at 0,0 on the map** - that's the bot's own presence beacon (TAK only delivers chat commands to announced contacts). Set `TAK_BOT_POSITION: "lat,lon"` to pin it at your server's location, or ignore it
 - **Radio has no GPS fix indoors** - normal; cold start can take minutes and needs sky view. Test near a window or outside
+- **Mobile data works at home but dies abroad / across a border** - the radio is probably stuck on a stale carrier APN with no roaming route. Check the APN in use: `adb shell "dumpsys connectivity | grep -o 'extra: [^,]*'"`. If it's an old per-network entry, set your operator's current APN via [Custom APN](#custom-apn-roaming-fix-optional). Note that the roaming toggle and network mode are rarely the cause when voice/registration work abroad - it's usually the APN
+- **With Custom APN on, Mumla takes a bit to connect after a cold boot** - normal. Applying the APN briefly cycles the data connection while the radio is still bringing up its cellular link, so Mumla's first connect attempt can come before data is ready. Mumla's own auto-reconnect brings it back once data is up (usually within a minute) - no action needed
 
 ## Roadmap
 

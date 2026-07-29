@@ -30,3 +30,29 @@ ptt_device=/dev/input/event2
 # /data/local/tmp/loc.conf containing the update interval in seconds:
 #   adb shell "echo 30 > /data/local/tmp/loc.conf"
 # Delete the file to disable. See "GPS tracking" in the README.
+
+# --- Custom APN (optional) ---
+# Some (usually older, locked-down) radios ship an outdated carrier APN that
+# works at home but fails when roaming abroad - data dies the moment you cross a
+# border even though the network still registers. When on, the radio installs
+# your operator's correct APN on boot (after the SIM registers): it disables
+# every APN it finds, then adds and selects the one below - so you never have to
+# know the stale APN's name. Requires the platform-signed apn-setter app (see
+# "Custom APN" in the README).
+#
+# Master switch. false = the APN is never touched (radio behaves like stock).
+# true = apply the settings below on every boot. This one line decides it all.
+custom_apn_mode=false
+# The APN string to use (ask your operator; many consumer plans use "internet").
+apn=
+# Your operator's MCC and MNC. Find them with:
+#   adb shell getprop gsm.sim.operator.numeric   (first 3 digits = MCC, rest = MNC)
+apn_mcc=
+apn_mnc=
+# Human-readable label for the APN (optional).
+apn_name=Custom APN
+# IP family: IP (IPv4), IPV6, or IPV4V6.
+apn_protocol=IPV4V6
+apn_roaming_protocol=IP
+# APN type - leave as-is unless your operator needs something specific.
+apn_type=default,supl

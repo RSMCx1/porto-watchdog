@@ -13,6 +13,7 @@ TAK/
 
 # apktool build intermediates
 pttbridge/build/
+apn-setter/build/
 
 # dev handoff notes - not for the public repo
 GPS_TAK_HANDOFF.md

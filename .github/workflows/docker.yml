@@ -52,13 +52,22 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # :latest is reserved for main and release tags. Feature branches publish
+      # under their own branch name (e.g. :apn) so they can be test-deployed
+      # without ever moving :latest - production only pulls code that reached main.
+      - name: Compute image tags
+        id: tags
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ] || [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tags=rsmcx1/porto-watchdog:latest,rsmcx1/porto-watchdog:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=rsmcx1/porto-watchdog:${{ github.ref_name }},rsmcx1/porto-watchdog:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile
           push: true
-          # Only main and release tags build, and both publish :latest
-          # (plus an immutable :sha). Feature branches never publish -
-          # production can only ever pull code that reached main.
-          tags: rsmcx1/porto-watchdog:latest,rsmcx1/porto-watchdog:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}

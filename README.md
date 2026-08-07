@@ -299,9 +299,9 @@ host=192.168.1.100         # IP or hostname of your server (DNS supported)
 port=4378                  # must match UDP_PORT on the server
 radio_id=radio01           # unique per radio (max 8 chars)
 secret=your-secret-here    # same secret as Step 1a
-device=/dev/input/event4   # knob input (don't change)
-button_device=/dev/input/event3  # side buttons (remove line to disable)
-ptt_device=/dev/input/event2     # RSM speaker-mic PTT (remove line to disable)
+device=/dev/input/event4   # rotary knob - VERIFY per unit (see below)
+button_device=/dev/input/event3  # side buttons - verify per unit (remove line to disable)
+ptt_device=/dev/input/event2     # RSM speaker-mic PTT - verify per unit (remove line to disable)
 ```
 
 GPS is deliberately not part of this file - it is enabled per radio
@@ -310,6 +310,29 @@ later via `loc.conf` (see [GPS Tracking](#gps-tracking-tak-integration)).
 Each radio needs a **unique `radio_id`**. The `secret` must match what
 the server has - either the shared `SECRET` or that radio's entry in
 `SECRETS`.
+
+**Verify the input event nodes for _this_ radio - they are not identical on
+every unit.** The `event4`/`event3`/`event2` defaults above are correct for
+plain TE300Ks, but units with extra hardware (e.g. an IMU / motion sensor) take
+up additional `/dev/input/eventN` slots and shift the rest up. List the devices
+and match by **name**, not number:
+
+```bash
+adb shell cat /proc/bus/input/devices
+```
+
+| `Name=`          | is the...        | `knob.conf` line |
+|------------------|------------------|------------------|
+| `channel-switch` | rotary knob      | `device=`        |
+| `gpio-keys`      | side buttons     | `button_device=` |
+| `telo_ptt`       | RSM speaker-mic  | `ptt_device=`    |
+
+Pointing the knob at the wrong node fails **silently and misleadingly**: channel
+switching and the side buttons do nothing, yet voice, heartbeat and GPS still
+work (those aren't knob-driven), so the radio looks fully onboarded. The daemon
+prints what it opened at startup - confirm it with
+`adb shell logcat -d | grep porto-watchdog`, which shows
+`knob=/dev/input/eventN (channel switch)`.
 
 **2d. Download the porto-watchdog binary**
 
@@ -888,6 +911,7 @@ the [latest release](../../releases/latest) or the
 - **PTT not working** - `adb shell dumpsys activity services | grep pttbridge`. If not running: `adb shell am startservice -a com.pttbridge.START` (safe to repeat - since v1.2 the service is idempotent and only starts what is not already running)
 - **Mumla or the daemon died in the field** - since pttbridge v1.2 they relaunch automatically within ~2 minutes (watch `adb shell logcat -d | grep heal:` to see it happen). During a Mumla outage the radio's screen shows `Disconnected`, then recovers on its own
 - **Channel switch / emergency / ident not working** - check `knob.conf` on the radio: `host` must be reachable from the radio's network. Check UDP port 4378 is open. Check remote watchdog container logs: `docker logs porto-watchdog`
+- **Knob and side buttons do nothing, but voice / heartbeat / GPS all work** - the input event nodes on this unit don't match `knob.conf`. Event numbers are not identical across TE300Ks (units with an IMU / extra sensors shift them up). Verify with `adb shell cat /proc/bus/input/devices` and match by name (`channel-switch` = knob, `gpio-keys` = buttons, `telo_ptt` = RSM PTT); fix the `device=` / `button_device=` / `ptt_device=` lines in `knob.conf`, re-push it, then restart the service: `adb shell "am force-stop com.pttbridge; am startservice -a com.pttbridge.START"`. Confirm what the daemon opened: `adb shell logcat -d | grep porto-watchdog` shows `knob=/dev/input/eventN (channel switch)`
 - **"HMAC verification failed"** - `secret` in `knob.conf` must match the server's `SECRET` or that radio's entry in `SECRETS`
 - **"Replay rejected"** - radio clock is off. Check: `adb shell date`
 - **"User not found"** - username in `RADIOS` must match Mumla's connection name (case-sensitive). Use `P*` wildcards if the name varies

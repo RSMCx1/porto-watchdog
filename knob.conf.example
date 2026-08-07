@@ -22,7 +22,10 @@ secret=CHANGE_ME_GENERATE_A_REAL_SECRET
 # Wrong node = dead knob/buttons even though heartbeat + GPS still work.
 device=/dev/input/event4
 
-# Input device - side buttons (KEY_F2=ident, KEY_F3=emergency)
+# Input device - side buttons (KEY_F2=ident, KEY_F3=emergency).
+# pttbridge.apk also reads this value to inject the boot auto-connect keypress
+# (the green "connect" button shares this gpio-keys node), so setting it
+# correctly fixes both the side buttons and Mumla auto-connect on boot.
 # Remove or leave empty to disable buttons. Verify the node per unit
 # (name "gpio-keys") - see the knob note above.
 button_device=/dev/input/event3

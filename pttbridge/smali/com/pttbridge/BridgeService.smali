@@ -56,7 +56,10 @@
 .end method
 
 # Launch Mumla and inject the auto-connect keypresses (green button
-# twice after 8s, via the hardware input device).
+# twice after 8s). The input node is read from knob.conf's button_device=
+# (the green button shares the gpio-keys device with the side buttons),
+# falling back to /dev/input/event3 - so one APK works across hardware revs
+# whose /dev/input/eventN numbering differs (e.g. IMU-equipped units).
 .method public static launchMumla(Landroid/content/Context;)V
     .locals 4
 
@@ -107,7 +110,7 @@
 
     const/4 v2, 0x2
 
-    const-string v3, "sleep 8 && sendevent /dev/input/event3 1 28 1 && sendevent /dev/input/event3 0 0 0 && sendevent /dev/input/event3 1 28 0 && sendevent /dev/input/event3 0 0 0 && sendevent /dev/input/event3 1 28 1 && sendevent /dev/input/event3 0 0 0 && sendevent /dev/input/event3 1 28 0 && sendevent /dev/input/event3 0 0 0"
+    const-string v3, "sleep 8; B=$(grep '^button_device=' /data/local/tmp/knob.conf 2>/dev/null | head -1 | cut -d= -f2 | tr -cd 'a-z0-9/'); B=${B:-/dev/input/event3}; sendevent $B 1 28 1; sendevent $B 0 0 0; sendevent $B 1 28 0; sendevent $B 0 0 0; sendevent $B 1 28 1; sendevent $B 0 0 0; sendevent $B 1 28 0; sendevent $B 0 0 0"
 
     aput-object v3, v1, v2
 

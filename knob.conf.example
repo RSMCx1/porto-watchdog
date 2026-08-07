@@ -17,8 +17,12 @@ secret=CHANGE_ME_GENERATE_A_REAL_SECRET
 # Input device - rotary knob (TE300K channel switch)
 device=/dev/input/event4
 
-# Input device - side buttons (KEY_F2=ident, KEY_F3=emergency)
-# Remove or leave empty to disable buttons
+# Input device - side buttons (KEY_F2=ident, KEY_F3=emergency).
+# pttbridge.apk also reads this value to inject the boot auto-connect
+# keypress (the green "connect" button shares this gpio-keys node), so on
+# hardware where the event numbers differ, setting this correctly fixes both
+# the side buttons and Mumla auto-connect on boot.
+# Remove or leave empty to disable buttons.
 button_device=/dev/input/event3
 
 # Input device - RSM PTT (telo_ptt, external speaker-mic)

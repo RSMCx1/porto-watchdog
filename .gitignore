@@ -13,6 +13,7 @@ TAK/
 
 # apktool build intermediates
 pttbridge/build/
+pttbridge/lib/
 apn-setter/build/
 
 # dev handoff notes - not for the public repo

@@ -27,6 +27,7 @@ The TE300K checked those boxes. With the help of [Anthropic's](https://www.anthr
 - **Per-radio keys** - each radio can have its own secret key, so if one radio is lost or compromised you can revoke it without affecting the rest of your fleet
 - **Zero-touch operation** - power on the radio and walk away. Everything starts automatically, connects to the server, and returns to the home screen. No screen taps required after initial setup
 - **Self-healing** - a watchdog on the radio checks every minute that Mumla and the local daemon are alive and relaunches whichever died (recovery within ~2 minutes). No adb cable needed in the field
+- **Works on more than one radio** - the button codes and the way buttons are read are both config, not code. Radios whose firmware blocks direct `/dev/input` access take their buttons from the Android framework instead, and everything downstream is unchanged. Two radio models run the same build today; adding a third is a config file and a keycode table
 - **Server runs anywhere** - the server side runs as a Docker container with all settings configured through environment variables, making it easy to deploy on any machine or manage through Portainer
 
 ## How It Works
@@ -54,6 +55,11 @@ Two watchdogs work together:
 | **Side button** | F2 | Ident - forwarded to remote watchdog, announces your name; also cancels the radio's active TAK emergency alert |
 | **Emergency button** (body or RSM) | F3 | Emergency - forwarded to remote watchdog, broadcasts alert |
 | **GPS** (optional) | - | Position reports - encrypted, forwarded to the TAK server if configured |
+
+The keys above are the TE300K's defaults. Every one of them is configurable, and
+a radio that reports different codes - or that cannot expose `/dev/input` at all
+- is handled by config rather than a separate build. See
+[Running on Another Radio](#running-on-another-radio).
 
 ### Architecture
 
@@ -210,6 +216,71 @@ adb shell setprop persist.telo.install enable
 The `persist.` prefix means it survives reboots - set it once and forget it.
 Without this, there's no way to get Mumla or pttbridge onto the radio short
 of modifying the system partition.
+
+## Running on Another Radio
+
+The project started on the Telo TE300K and every default is that radio's, so
+nothing here changes for an existing fleet. A second radio - the YiNiTone B5,
+also sold as the Anysecu T56 (UNIPRO L809) - now runs the same build. The parts
+that turned out to be radio-specific became configuration rather than a fork.
+
+Three things vary between radios, and they are independent of each other.
+
+**1. Can the daemon read `/dev/input` at all?**
+
+Platform signing gets you the `input` group, but SELinux is a *separate* gate and
+it checks the process domain, not the certificate:
+
+```bash
+adb pull /sepolicy
+sesearch -A -t input_device -c chr_file sepolicy | grep platform_app
+```
+
+No output means an app-launched daemon can never open those nodes on that radio,
+however it is signed. Two traps here. First, `shell` is usually in that list, so
+`adb shell getevent` works fine and tells you nothing about what the app can do -
+it is not proof. Second, a radio running SELinux `Permissive` lets the evdev path
+work regardless of policy, which is the real reason it works on the TE300K -
+check `getenforce` as well as the policy.
+
+When evdev is unavailable, set `input_source=keyevent`. pttbridge's `KeyService`
+receives each button from the framework as an ordinary `KeyEvent` and forwards the
+edge to the daemon over the abstract socket `@porto_key`. The daemon keeps
+everything else it always did - debounce, the emergency hold gate, HMAC signing,
+UDP - so only where the button comes from changes.
+
+**2. Which codes do the buttons report?**
+
+Set `key_*` for the evdev path or `keyevent_*` for the framework path.
+`knob.conf.example` lists both, with the discovery command for each and reference
+mappings for the two known radios. Kernel scancodes and Android keyCodes are
+different numbers for the same physical button, so use the command that matches
+the backend you are on.
+
+**3. Where is the daemon allowed to execute from?**
+
+`/data/local/tmp` works on some radios and is refused on others: it is labelled
+`shell_data_file`, which no app domain may execute. On those radios the daemon
+ships inside the APK as `lib/armeabi-v7a/libportowatchdog.so`, because the
+extracted native-library directory is the one place an app may execute from, and
+`Paths.java` resolves the path at runtime. This only applies to
+`input_source=keyevent` radios - an existing radio keeps running the binary it
+already has rather than starting a second one alongside it.
+
+Two optional extras exist for radios that lack a vendor idle screen or a usable
+key tone, both off by default:
+
+- **Idle display** - a bare channel and radio-ID screen, no settings and no status
+  bar, fed from the same data the server already sends. Start it with
+  `am start -n com.pttbridge/.ScreenActivity`.
+- **PTT tone** - `ptt_tone=true` plays a confirmation chirp on each PTT edge, and a
+  distinct flat tone if the radio is not on a channel. It does not work on the
+  TE300K; `knob.conf.example` explains why and what was measured.
+
+Before any of this, confirm the new radio's firmware is signed with the public
+AOSP platform key: pull `/system/framework/framework-res.apk` and compare its
+certificate with `platform.x509.pem`. If they differ you need that radio's own
+key, and the signature-level permissions described above are simply unavailable.
 
 ## Setup Guide
 
@@ -895,7 +966,9 @@ Unsigned or expired packets are silently dropped.
 | `channel_bot.py` | Docker | Remote watchdog server |
 | `docker-compose.yml` | Docker | Stack definition |
 | `docker/Dockerfile` | Docker | Container build |
-| `pttbridge/` | Source | Smali source for pttbridge.apk (build docs inside) |
+| `pttbridge/` | Source | Smali and Java source for pttbridge.apk (build docs inside) |
+| `pttbridge/src/` | Source | Java for the classes added for multi-radio support |
+| `pttbridge/build.sh` | Source | Compiles the Java, merges the smali, assembles and signs the APK |
 | `pttbridge.apk` | Radio | Boot autostart + PTT socket bridge + Mumla auto-connect + GPS reader + self-healing watchdog |
 | `apn-setter/` | Source | Smali source for apn-setter.apk (build docs inside) |
 | `apn-setter.apk` | Radio | Platform-signed helper that sets a custom APN (optional roaming fix) |

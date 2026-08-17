@@ -1,8 +1,10 @@
 /*
- * porto-watchdog - TE300K local watchdog daemon
- * ==============================================
- * Runs in the background on the TE300K radio, intercepts ALL hardware
- * key events, and routes them:
+ * porto-watchdog - local watchdog daemon for Android PoC radios
+ * =============================================================
+ * Runs in the background on the radio, intercepts ALL hardware key events,
+ * and routes them. Input device nodes and keycodes are both configurable
+ * (see knob.conf), so this is not tied to one model - the layout below is
+ * the Telo TE300K, which is simply the radio it was written on.
  *
  *   LOCAL (PTT → Mumla via pttbridge.apk socket):
  *     /dev/input/event2  KEY_F1 (59)  = RSM PTT press/release (telo_ptt)
@@ -202,12 +204,27 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
 
 /* ---- End crypto ---- */
 
-/* TE300K keycodes */
-#define KEY_PTT         59    /* KEY_F1 = PTT button (event3) */
-#define BTN_IDENT       60    /* KEY_F2 = side/ident button (event3) */
-#define BTN_EMERGENCY   61    /* KEY_F3 = emergency button (event3) */
-#define KNOB_CCW        183   /* KEY_F13 = knob counter-clockwise (event4) */
-#define KNOB_CW         184   /* KEY_F14 = knob clockwise (event4) */
+/* Default keycodes (TE300K). Every radio reports different codes for its
+ * buttons, so these are only the fallbacks - override them in knob.conf with
+ * key_ptt / key_ident / key_emergency / key_chan_prev / key_chan_next.
+ *
+ * To discover the codes on a new radio, run `getevent -lt` over adb and press
+ * each button once. Note that getevent buffers its output when it is not
+ * writing to a terminal, so use the count form (`getevent -lt -c 8`), which
+ * exits cleanly and flushes, rather than killing a long-running capture.
+ *
+ * Known mappings:
+ *   Telo TE300K   PTT KEY_F1(59)   ident KEY_F2(60)  emerg KEY_F3(61)
+ *                 prev KEY_F13(183) next KEY_F14(184)
+ *   YiNiTone B5 / Anysecu T56 (UNIPRO L809):
+ *                 PTT KEY_CHAT(216) ident KEY_F6(64) emerg KEY_F7(65)
+ *                 prev KEY_F1(59)   next KEY_HELP(138)
+ */
+#define KEY_PTT         59    /* KEY_F1 = PTT button */
+#define BTN_IDENT       60    /* KEY_F2 = side/ident button */
+#define BTN_EMERGENCY   61    /* KEY_F3 = emergency button */
+#define KNOB_CCW        183   /* KEY_F13 = knob counter-clockwise / prev */
+#define KNOB_CW         184   /* KEY_F14 = knob clockwise / next */
 
 /* UDP packet constants */
 #define PKT_SIZE        45
@@ -252,6 +269,11 @@ static void hmac_sha256(const unsigned char *key, unsigned int keylen,
  * per GPS fix) */
 #define LOC_SOCKET_NAME "porto_loc"
 
+/* Key-event socket name (abstract namespace). Only used when
+ * input_source=keyevent: we listen, pttbridge.apk's accessibility service
+ * connects and writes one "<CMD> <1|0>" line per hardware key edge. */
+#define KEY_SOCKET_NAME "porto_key"
+
 /* Default config path (auto-loaded if no args given) */
 #define DEFAULT_CONFIG  "/data/local/tmp/knob.conf"
 
@@ -263,6 +285,31 @@ static char cfg_secret[256] = "";
 static char cfg_device[256] = "/dev/input/event4";           /* knob */
 static char cfg_button_device[256] = "/dev/input/event3";    /* body buttons (gpio-keys) */
 static char cfg_ptt_device[256] = "/dev/input/event2";       /* RSM PTT (telo_ptt) */
+
+/* Input backend. 0 = evdev (default, unchanged): read the kernel input nodes
+ * above. 1 = keyevent: open no input node at all and take button edges from
+ * pttbridge.apk over @porto_key instead. Needed on radios whose SELinux policy
+ * denies app domains access to input_device, where the framework nonetheless
+ * dispatches the buttons as ordinary KeyEvents (YiNiTone B5 / Anysecu T56,
+ * UNIPRO L809). PTT is not carried on that socket - it never reaches the
+ * network, so the APK keys Mumla directly. */
+static int cfg_input_keyevent = 0;
+
+/* Keycodes, overridable per radio (see the defaults block above). The same
+ * PTT code is used for the body button and the speaker-mic: on both radios
+ * tested they report an identical code and differ only by input node. */
+static int cfg_key_ptt       = KEY_PTT;
+static int cfg_key_ident     = BTN_IDENT;
+static int cfg_key_emergency = BTN_EMERGENCY;
+static int cfg_key_chan_prev = KNOB_CCW;
+static int cfg_key_chan_next = KNOB_CW;
+
+/* Require the emergency button to be held this long (ms) before broadcasting.
+ * 0 keeps the historic behaviour: fire immediately on press. Radios whose
+ * emergency button sits on the front panel - rather than being a recessed or
+ * shrouded top-face key - want a deliberate hold so a knock against a harness
+ * or a snag in a pocket cannot trigger a fleet-wide alert. */
+static int cfg_emergency_hold_ms = 0;
 
 /* Custom APN (optional). Fixes outdated / roaming-incompatible carrier APNs on
  * locked-down radios by writing the operator's correct APN through the
@@ -343,6 +390,35 @@ static int loc_listen(void) {
     strncpy(addr.sun_path + 1, LOC_SOCKET_NAME, sizeof(addr.sun_path) - 2);
 
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOC_SOCKET_NAME);
+
+    if (bind(fd, (struct sockaddr *)&addr, len) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 4) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* ---- Key-event socket (button edges from pttbridge.apk) ---- */
+
+/* Create the abstract-namespace listening socket for hardware key edges.
+ * Same shape as loc_listen(): we listen, the APK connects per event. */
+static int key_listen(void) {
+    int fd;
+    struct sockaddr_un addr;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, KEY_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(KEY_SOCKET_NAME);
 
     if (bind(fd, (struct sockaddr *)&addr, len) < 0) {
         close(fd);
@@ -791,6 +867,98 @@ static int send_udp_command(int sock_fd, struct sockaddr_in *dest,
     return 1;
 }
 
+/* Accept one connection on the key socket and act on a single key edge.
+ *
+ * Wire format, one line, written by pttbridge.apk's KeyService:
+ *     IDENT 1 / IDENT 0 / EMERGENCY 1 / EMERGENCY 0 / NEXT 1 / PREV 1
+ * i.e. the raw edge only. Every decision - which press counts, the debounce
+ * window, and the emergency hold gate - stays here, so the keyevent backend
+ * and the evdev backend behave identically and there is one implementation
+ * of the semantics. PTT is deliberately absent: it has no UDP command.
+ *
+ * The evdev handlers in main() are left untouched and are the only code a
+ * TE300K ever executes. */
+static void handle_key_client(int listen_fd, unsigned char pkt[PKT_SIZE],
+                              long long *last_btn_send,
+                              long long *last_knob_send,
+                              long long *emergency_down_ms) {
+    char buf[64];
+    char cmd[24];
+    int value = 0;
+    int total = 0;
+
+    int cfd = accept(listen_fd, NULL, NULL);
+    if (cfd < 0) return;
+
+    /* The APK writes immediately then closes; never stall the event loop */
+    struct timeval tv = {0, 500000};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (total < (int)sizeof(buf) - 1) {
+        int n = read(cfd, buf + total, sizeof(buf) - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        if (memchr(buf, '\n', total)) break;
+    }
+    close(cfd);
+    buf[total] = '\0';
+
+    if (sscanf(buf, "%23s %d", cmd, &value) != 2) return;
+
+    if (strcmp(cmd, "IDENT") == 0) {
+        if (value != 1) return;
+        if (want_udp && !udp_enabled) try_resolve_udp();
+        if (udp_enabled)
+            send_udp_command(udp_fd, &udp_dest, pkt, CMD_IDENT,
+                             "IDENT", last_btn_send);
+    } else if (strcmp(cmd, "NEXT") == 0) {
+        if (value != 1) return;
+        if (want_udp && !udp_enabled) try_resolve_udp();
+        if (udp_enabled)
+            send_udp_command(udp_fd, &udp_dest, pkt, CMD_NEXT,
+                             "NEXT", last_knob_send);
+    } else if (strcmp(cmd, "PREV") == 0) {
+        if (value != 1) return;
+        if (want_udp && !udp_enabled) try_resolve_udp();
+        if (udp_enabled)
+            send_udp_command(udp_fd, &udp_dest, pkt, CMD_PREV,
+                             "PREV", last_knob_send);
+    } else if (strcmp(cmd, "EMERGENCY") == 0) {
+        /* Byte-for-byte the same policy as the evdev path below. */
+        if (cfg_emergency_hold_ms <= 0) {
+            if (value == 1) {
+                if (want_udp && !udp_enabled) try_resolve_udp();
+                if (udp_enabled)
+                    send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
+                                     "EMERGENCY", last_btn_send);
+            }
+        } else if (value == 1) {
+            *emergency_down_ms = now_ms();
+            printf("porto-watchdog: EMERGENCY armed, hold %dms\n",
+                   cfg_emergency_hold_ms);
+            fflush(stdout);
+        } else if (*emergency_down_ms > 0) {
+            long long held = now_ms() - *emergency_down_ms;
+            *emergency_down_ms = 0;
+            if (held >= cfg_emergency_hold_ms) {
+                printf("porto-watchdog: EMERGENCY held %lldms"
+                       " (threshold %dms)\n",
+                       held, cfg_emergency_hold_ms);
+                fflush(stdout);
+                if (want_udp && !udp_enabled) try_resolve_udp();
+                if (udp_enabled)
+                    send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
+                                     "EMERGENCY", last_btn_send);
+            } else {
+                printf("porto-watchdog: EMERGENCY released after %lldms,"
+                       " ignored (need %dms)\n",
+                       held, cfg_emergency_hold_ms);
+                fflush(stdout);
+            }
+        }
+    }
+}
+
 /* ---- Screen feedback (server -> radio) ----
  * The server replies to every packet we send (including the minutely
  * 'H' heartbeat) with a signed 'C' packet carrying our current Mumble
@@ -868,6 +1036,13 @@ static int load_config(const char *path) {
             else if (strcmp(key, "device") == 0) strncpy(cfg_device, val, sizeof(cfg_device)-1);
             else if (strcmp(key, "button_device") == 0) strncpy(cfg_button_device, val, sizeof(cfg_button_device)-1);
             else if (strcmp(key, "ptt_device") == 0) strncpy(cfg_ptt_device, val, sizeof(cfg_ptt_device)-1);
+            else if (strcmp(key, "input_source") == 0) cfg_input_keyevent = (strcmp(val, "keyevent") == 0);
+            else if (strcmp(key, "key_ptt") == 0) cfg_key_ptt = atoi(val);
+            else if (strcmp(key, "key_ident") == 0) cfg_key_ident = atoi(val);
+            else if (strcmp(key, "key_emergency") == 0) cfg_key_emergency = atoi(val);
+            else if (strcmp(key, "key_chan_prev") == 0) cfg_key_chan_prev = atoi(val);
+            else if (strcmp(key, "key_chan_next") == 0) cfg_key_chan_next = atoi(val);
+            else if (strcmp(key, "emergency_hold_ms") == 0) cfg_emergency_hold_ms = atoi(val);
             else if (strcmp(key, "custom_apn_mode") == 0) cfg_custom_apn_mode = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "yes") == 0);
             else if (strcmp(key, "apn") == 0) strncpy(cfg_apn, val, sizeof(cfg_apn)-1);
             else if (strcmp(key, "apn_name") == 0) strncpy(cfg_apn_name, val, sizeof(cfg_apn_name)-1);
@@ -978,13 +1153,14 @@ static void apply_apn(void) {
 }
 
 int main(int argc, char *argv[]) {
-    int btn_fd, knob_fd = -1, ptt_fd_dev = -1, loc_fd = -1;
+    int btn_fd = -1, knob_fd = -1, ptt_fd_dev = -1, loc_fd = -1, key_fd = -1;
     struct input_event ev;
     long long last_knob_send = 0;
     long long last_btn_send = 0;
     long long last_loc_send = 0;
+    long long emergency_down_ms = 0;   /* 0 = emergency button not held */
     unsigned char pkt[PKT_SIZE];
-    struct pollfd fds[5];
+    struct pollfd fds[6];
     int nfds;
     int config_loaded = 0;
 
@@ -1028,8 +1204,12 @@ int main(int argc, char *argv[]) {
      *   3. Try DNS once (non-blocking - retries lazily on each keypress)
      */
 
-    /* 1. Open button/PTT device (event3) - retry at boot */
-    {
+    /* 1. Open button/PTT device (event3) - retry at boot.
+     * Skipped whole on the keyevent backend: those radios deny the app
+     * domain /dev/input, and pttbridge.apk feeds us over @porto_key. */
+    if (cfg_input_keyevent) {
+        printf("porto-watchdog: input_source=keyevent (no evdev nodes opened)\n");
+    } else {
         int retries;
         for (retries = 0; retries < 60; retries++) {
             btn_fd = open(cfg_button_device, O_RDONLY);
@@ -1046,7 +1226,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Open knob device (event4) - optional, also retry briefly */
-    {
+    if (!cfg_input_keyevent) {
         int retries;
         for (retries = 0; retries < 10; retries++) {
             knob_fd = open(cfg_device, O_RDONLY);
@@ -1061,7 +1241,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Open RSM PTT device (event2) - optional, retry briefly */
-    {
+    if (!cfg_input_keyevent) {
         int retries;
         for (retries = 0; retries < 10; retries++) {
             ptt_fd_dev = open(cfg_ptt_device, O_RDONLY);
@@ -1102,6 +1282,18 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "porto-watchdog: loc socket unavailable (GPS reporting disabled)\n");
     }
 
+    /* 5. Key socket - the only input on the keyevent backend, so a failure
+     * here means the radio has no buttons at all: fail loudly and let the
+     * APK's HealthRunner restart us (usually a stale instance still bound). */
+    if (cfg_input_keyevent) {
+        key_fd = key_listen();
+        if (key_fd < 0) {
+            fprintf(stderr, "porto-watchdog: cannot bind @%s: %s\n",
+                    KEY_SOCKET_NAME, strerror(errno));
+            return 1;
+        }
+    }
+
     /* Startup banner */
     printf("porto-watchdog: TE300K all-in-one handler\n");
     printf("porto-watchdog: buttons=%s (PTT%s)\n",
@@ -1119,15 +1311,22 @@ int main(int argc, char *argv[]) {
     if (loc_fd >= 0)
         printf("porto-watchdog: loc socket=@%s (GPS -> 'L' packets)\n",
                LOC_SOCKET_NAME);
+    if (key_fd >= 0)
+        printf("porto-watchdog: key socket=@%s (buttons from pttbridge.apk)\n",
+               KEY_SOCKET_NAME);
     fflush(stdout);
 
     /* Set up poll: btn_fd always present, the rest optional. */
     nfds = 0;
-    fds[nfds].fd = btn_fd;
-    fds[nfds].events = POLLIN;
-    nfds++;
+    int btn_poll_idx = -1;
+    if (btn_fd >= 0) {
+        btn_poll_idx = nfds;
+        fds[nfds].fd = btn_fd;
+        fds[nfds].events = POLLIN;
+        nfds++;
+    }
 
-    int knob_poll_idx = -1, ptt_poll_idx = -1, loc_poll_idx = -1;
+    int knob_poll_idx = -1, ptt_poll_idx = -1, loc_poll_idx = -1, key_poll_idx = -1;
     int udp_poll_idx = -1;
     long long last_heartbeat = 0;
 
@@ -1157,6 +1356,12 @@ int main(int argc, char *argv[]) {
     if (loc_fd >= 0) {
         loc_poll_idx = nfds;
         fds[nfds].fd = loc_fd;
+        fds[nfds].events = POLLIN;
+        nfds++;
+    }
+    if (key_fd >= 0) {
+        key_poll_idx = nfds;
+        fds[nfds].fd = key_fd;
         fds[nfds].events = POLLIN;
         nfds++;
     }
@@ -1198,7 +1403,7 @@ int main(int argc, char *argv[]) {
         if (ret == 0) continue;
 
         /* Button events: event3 (gpio-keys) */
-        if (fds[0].revents & POLLIN) {
+        if (btn_poll_idx >= 0 && (fds[btn_poll_idx].revents & POLLIN)) {
             ssize_t n = read(btn_fd, &ev, sizeof(ev));
             if (n < (ssize_t)sizeof(ev)) {
                 if (n < 0 && errno == EINTR) continue;
@@ -1208,7 +1413,7 @@ int main(int argc, char *argv[]) {
 
             if (ev.type == EV_KEY) {
                 /* PTT: connect-per-event (server closes after each read) */
-                if (ev.code == KEY_PTT && (ev.value == 1 || ev.value == 0)) {
+                if (ev.code == cfg_key_ptt && (ev.value == 1 || ev.value == 0)) {
                     int ptt_fd = ptt_connect();
                     if (ptt_fd >= 0) {
                         ptt_send(ptt_fd, ev.value);
@@ -1220,16 +1425,53 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, "porto-watchdog: PTT socket unavailable\n");
                     }
                 }
-                /* Emergency & Ident: only on press (value 1) */
-                else if (ev.value == 1 && (ev.code == BTN_EMERGENCY || ev.code == BTN_IDENT)) {
+                /* Ident: on press */
+                else if (ev.value == 1 && ev.code == cfg_key_ident) {
                     if (want_udp && !udp_enabled) try_resolve_udp();
-                    if (udp_enabled) {
-                        if (ev.code == BTN_EMERGENCY)
-                            send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
-                                             "EMERGENCY", &last_btn_send);
-                        else if (ev.code == BTN_IDENT)
-                            send_udp_command(udp_fd, &udp_dest, pkt, CMD_IDENT,
-                                             "IDENT", &last_btn_send);
+                    if (udp_enabled)
+                        send_udp_command(udp_fd, &udp_dest, pkt, CMD_IDENT,
+                                         "IDENT", &last_btn_send);
+                }
+                /* Emergency: on press, or on release once held long enough.
+                 * The hold is measured from the button's own down event rather
+                 * than from a timer, so a press that is still in progress when
+                 * the radio is powered off simply never fires. */
+                else if (ev.code == cfg_key_emergency
+                         && (ev.value == 1 || ev.value == 0)) {
+                    if (cfg_emergency_hold_ms <= 0) {
+                        if (ev.value == 1) {
+                            if (want_udp && !udp_enabled) try_resolve_udp();
+                            if (udp_enabled)
+                                send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
+                                                 "EMERGENCY", &last_btn_send);
+                        }
+                    } else if (ev.value == 1) {
+                        emergency_down_ms = now_ms();
+                        printf("porto-watchdog: EMERGENCY armed, hold %dms\n",
+                               cfg_emergency_hold_ms);
+                        fflush(stdout);
+                    } else if (emergency_down_ms > 0) {
+                        long long held = now_ms() - emergency_down_ms;
+                        emergency_down_ms = 0;
+                        if (held >= cfg_emergency_hold_ms) {
+                            /* Log the duration on success too, not just on
+                             * rejection: the margin between a firing hold and
+                             * the threshold is what tells you whether the
+                             * threshold is set sensibly for real operators. */
+                            printf("porto-watchdog: EMERGENCY held %lldms"
+                                   " (threshold %dms)\n",
+                                   held, cfg_emergency_hold_ms);
+                            fflush(stdout);
+                            if (want_udp && !udp_enabled) try_resolve_udp();
+                            if (udp_enabled)
+                                send_udp_command(udp_fd, &udp_dest, pkt, CMD_EMERGENCY,
+                                                 "EMERGENCY", &last_btn_send);
+                        } else {
+                            printf("porto-watchdog: EMERGENCY released after %lldms,"
+                                   " ignored (need %dms)\n",
+                                   held, cfg_emergency_hold_ms);
+                            fflush(stdout);
+                        }
                     }
                 }
             }
@@ -1244,13 +1486,13 @@ int main(int argc, char *argv[]) {
                 break;
             }
             if (ev.type == EV_KEY && ev.value == 1
-                    && (ev.code == KNOB_CW || ev.code == KNOB_CCW)) {
+                    && (ev.code == cfg_key_chan_next || ev.code == cfg_key_chan_prev)) {
                 if (want_udp && !udp_enabled) try_resolve_udp();
                 if (udp_enabled) {
-                    if (ev.code == KNOB_CW)
+                    if (ev.code == cfg_key_chan_next)
                         send_udp_command(udp_fd, &udp_dest, pkt, CMD_NEXT,
                                          "NEXT", &last_knob_send);
-                    else if (ev.code == KNOB_CCW)
+                    else if (ev.code == cfg_key_chan_prev)
                         send_udp_command(udp_fd, &udp_dest, pkt, CMD_PREV,
                                          "PREV", &last_knob_send);
                 }
@@ -1262,6 +1504,12 @@ int main(int argc, char *argv[]) {
             handle_loc_client(loc_fd, &last_loc_send);
         }
 
+        /* Button edges from pttbridge.apk (keyevent backend) */
+        if (key_poll_idx >= 0 && (fds[key_poll_idx].revents & POLLIN)) {
+            handle_key_client(key_fd, pkt, &last_btn_send,
+                              &last_knob_send, &emergency_down_ms);
+        }
+
         /* RSM PTT events: event2 (telo_ptt) */
         if (ptt_poll_idx >= 0 && (fds[ptt_poll_idx].revents & POLLIN)) {
             ssize_t n = read(ptt_fd_dev, &ev, sizeof(ev));
@@ -1270,7 +1518,7 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "RSM PTT read error: %s\n", strerror(errno));
                 break;
             }
-            if (ev.type == EV_KEY && ev.code == KEY_PTT
+            if (ev.type == EV_KEY && ev.code == cfg_key_ptt
                     && (ev.value == 1 || ev.value == 0)) {
                 int ptt_fd = ptt_connect();
                 if (ptt_fd >= 0) {
@@ -1288,8 +1536,9 @@ int main(int argc, char *argv[]) {
 
     if (udp_fd >= 0) close(udp_fd);
     if (loc_fd >= 0) close(loc_fd);
+    if (key_fd >= 0) close(key_fd);
     if (ptt_fd_dev >= 0) close(ptt_fd_dev);
     if (knob_fd >= 0) close(knob_fd);
-    close(btn_fd);
+    if (btn_fd >= 0) close(btn_fd);
     return 0;
 }

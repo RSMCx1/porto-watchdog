@@ -43,7 +43,12 @@
 
     const/4 v2, 0x2
 
-    const-string v3, "exec /system/bin/logwrapper /data/local/tmp/ptt_bridge"
+    # Resolved at runtime: radios that cannot exec from /data/local/tmp run the
+    # copy packaged in the APK instead. Returns this radio's existing logwrapper
+    # command unchanged unless input_source=keyevent.
+    invoke-static {}, Lcom/pttbridge/Paths;->launchCommand()Ljava/lang/String;
+
+    move-result-object v3
 
     aput-object v3, v1, v2
 
@@ -56,7 +61,8 @@
 .end method
 
 # Launch Mumla and inject the auto-connect keypresses (green button
-# twice after 8s). The input node is read from knob.conf's button_device=
+# twice after 8s), then hand over to Inject for radios that need the
+# framework path instead. The input node is read from knob.conf's button_device=
 # (the green button shares the gpio-keys device with the side buttons),
 # falling back to /dev/input/event3 - so one APK works across hardware revs
 # whose /dev/input/eventN numbering differs (e.g. IMU-equipped units).
@@ -119,6 +125,13 @@
     .catch Ljava/lang/Exception; {:try_start_autoconnect .. :try_end_autoconnect} :catch_autoconnect
 
     :catch_autoconnect
+    # Auto-connect for radios where the sendevent sequence above cannot work:
+    # SELinux may deny /dev/input outright, and gpio-keys need not even declare
+    # KEY_ENTER. Inject no-ops unless input_source=keyevent, so evdev radios keep
+    # exactly the behaviour above and never press ENTER twice. Placed after the
+    # catch so a failed exec above does not skip it.
+    invoke-static {}, Lcom/pttbridge/Inject;->autoConnect()V
+
     return-void
 .end method
 
@@ -152,7 +165,9 @@
 
     # Daemon: only when not already running - repeated START intents
     # (and the HealthRunner) must never spawn duplicates
-    const-string v0, "/data/local/tmp/ptt_bridge"
+    invoke-static {}, Lcom/pttbridge/Paths;->daemon()Ljava/lang/String;
+
+    move-result-object v0
 
     invoke-static {v0}, Lcom/pttbridge/HealthRunner;->isRunning(Ljava/lang/String;)Z
 

@@ -1,5 +1,10 @@
-# porto-watchdog config for TE300K
+# porto-watchdog radio config
 # Push to: /data/local/tmp/knob.conf
+#
+# One file describes one radio. The daemon and pttbridge.apk both read it, so
+# they can never disagree about what kind of radio they are running on. Defaults
+# throughout are the Telo TE300K's, which is the radio this project started on:
+# a config written before an option existed keeps behaving exactly as it did.
 
 # IP or hostname of the machine running the remote watchdog (DNS supported)
 host=192.168.1.100
@@ -14,7 +19,29 @@ radio_id=radio01
 # Generate with: docker run --rm rsmcx1/porto-watchdog --gen-secret
 secret=CHANGE_ME_GENERATE_A_REAL_SECRET
 
-# Input device - rotary knob (TE300K channel switch)
+# --- Input backend ---
+# Where the daemon gets its button presses.
+#
+#   evdev     (default) read /dev/input/eventN directly. Needs the daemon to be
+#             able to open those nodes, which means either root, a permissive
+#             SELinux policy, or a policy that grants its domain input_device.
+#   keyevent  take them from the Android framework instead. pttbridge.apk's
+#             KeyService receives each button as an ordinary KeyEvent and
+#             forwards the edge to the daemon over abstract socket @porto_key.
+#
+# Use keyevent when the radio's SELinux policy denies /dev/input to an app uid.
+# That is not a signing problem and no amount of platform signing fixes it -
+# check the policy, not the certificate:
+#   adb pull /sepolicy && sesearch -A -t input_device -c chr_file sepolicy
+# If the app's domain (usually platform_app) is not in the output, evdev cannot
+# work on that radio. Note that `shell` usually IS in it, so adb getevent works
+# and proves nothing about what the app can do.
+#
+# On keyevent radios the three device nodes below are unused; set the
+# keyevent_* codes further down instead.
+#input_source=evdev
+
+# Input device - rotary knob (channel switch). evdev only.
 # NB: event numbers VARY per unit. Verify with
 #   adb shell cat /proc/bus/input/devices
 # and match by name: knob = "channel-switch". Units with an IMU / extra
@@ -34,6 +61,107 @@ button_device=/dev/input/event3
 # Remove or leave empty to disable RSM PTT. Verify the node per unit
 # (name "telo_ptt") - see the knob note above.
 ptt_device=/dev/input/event2
+
+# --- Button keycodes, evdev path (optional) ---
+# Which key event each function listens for. The defaults are the TE300K's
+# codes, so existing radios need none of this. Any other radio almost certainly
+# reports different codes and needs all five set.
+#
+# Discover them by pressing each button once under:
+#   adb shell getevent -lt -c 8
+# Use the counted form: getevent buffers its output when it is not writing to a
+# terminal, so a long capture that you kill loses everything it collected. The
+# -c form exits by itself and flushes. Press one button per capture and the
+# mapping is unambiguous.
+#
+# The same key_ptt value covers the body PTT and the speaker-mic PTT - on every
+# radio tested they report the same code and differ only by input node.
+#
+# Reference mappings:
+#   Telo TE300K                key_ptt=59  key_ident=60 key_emergency=61
+#                              key_chan_prev=183 key_chan_next=184
+#   YiNiTone B5 / Anysecu T56  key_ptt=216 key_ident=64 key_emergency=65
+#     (UNIPRO L809)            key_chan_prev=59  key_chan_next=138
+#
+# The B5 codes are listed for completeness - they are what its kernel emits -
+# but that radio's policy blocks /dev/input for the app, so in practice it runs
+# input_source=keyevent and uses the keyevent_* codes instead.
+#key_ptt=59
+#key_ident=60
+#key_emergency=61
+#key_chan_prev=183
+#key_chan_next=184
+
+# --- Button keycodes, keyevent path (optional) ---
+# The Android keyCode for each function, used when input_source=keyevent. These
+# are read by pttbridge.apk, not by the daemon. Defaults are the B5's codes.
+#
+# Discover them from the framework's own view of the buttons - getevent reports
+# kernel scancodes, which are NOT these numbers:
+#   adb shell dumpsys input | grep -A2 RecentQueue
+# Press one button, run that, and read the keyCode off the newest entry. A
+# keylayout file maps scancode to keyCode and the active one may live in /oem,
+# overriding the copy in /system - check both before trusting a mapping.
+#
+# Reference mapping, YiNiTone B5 / Anysecu T56 (UNIPRO L809):
+#   keyevent_ptt=261  keyevent_ident=21  keyevent_emergency=22
+#   keyevent_chan_next=260  keyevent_chan_prev=266
+#keyevent_ptt=261
+#keyevent_ident=21
+#keyevent_emergency=22
+#keyevent_chan_next=260
+#keyevent_chan_prev=266
+
+# Whether those buttons are swallowed rather than passed on to the foreground
+# app. Leave true unless a button also carries a vendor function worth keeping,
+# or the radio will act on both meanings at once.
+#keyevent_consume=true
+
+# Keep the radio interactive so buttons still arrive while the screen is off.
+# On API 22 the window policy drops non-media keys once the display sleeps, so
+# nothing above it - including KeyService - ever sees them. This holds a
+# SCREEN_DIM_WAKE_LOCK to prevent that, and costs battery for as long as it is
+# held. Intended for permanently powered installs; leave it false on any radio
+# that has to last a shift off charger.
+#keep_interactive=false
+
+# --- PTT confirmation tone (optional) ---
+# A short chirp through the radio's own speaker on each PTT edge: rising on
+# press, falling on release, and a flat low tone when the radio is not on a
+# channel - so keying up with no server behind it does not sound like a normal
+# transmission. Played by pttbridge.apk.
+#
+# This works on the keyevent path. It does NOT work on the TE300K, which powers
+# its audio mixer down when idle and takes several hundred ms to wake it, so a
+# ~140ms chirp lands after the press it was meant to confirm. Five approaches
+# were measured there - AudioTrack static and streaming, a fresh track per
+# press, SoundPool, and a silent keep-alive stream - and the only one that fixes
+# it holds an output stream open permanently, which is not a trade worth making
+# on a radio that runs all day off charger. Off by default everywhere.
+#ptt_tone=false
+
+# Tone volume, percent. The chirp is synthesised near full scale and is loud
+# next to incoming Mumble audio, which arrives at whatever level the sending
+# radio produced. 25 is a reasonable starting point.
+#ptt_tone_volume=100
+
+# --- Emergency hold (optional) ---
+# Milliseconds the emergency button must be held before the alert is broadcast.
+# 0 (default) fires immediately on press, which suits radios whose emergency key
+# is recessed or shrouded on the top face. Radios that only have front-panel
+# buttons should require a deliberate hold, so a knock against a harness or a
+# snag in a pocket cannot trigger a fleet-wide alert.
+#
+# 1000 is the recommended value, and it is measured rather than guessed. On the
+# bench an accidental-style tap came in at 131ms, while an operator deliberately
+# aiming for "about two seconds" actually produced 1450ms - so a 1500ms
+# threshold REJECTED a press that was meant to fire. Under stress, with gloves,
+# holds get shorter and more variable, and a missed emergency alert is far worse
+# than an accidental one. 1000ms sits well clear of both: ~8x an accidental tap,
+# with real margin below a genuine hold.
+#
+# A press still in progress when the radio powers off never fires.
+#emergency_hold_ms=0
 
 # --- GPS position reporting (optional) ---
 # GPS is NOT configured here. It is enabled per radio by creating
